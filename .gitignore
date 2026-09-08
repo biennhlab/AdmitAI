@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Phase 0 ignores
+.env
+__pycache__/
+*.db
+venv/
+.pytest_cache/
+eval_results/
+data/raw/
+*.pyc
+
+docs/acquired_knowledge
