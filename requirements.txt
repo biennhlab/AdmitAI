@@ -27,7 +27,7 @@ qdrant-client==1.11.*
 rank-bm25==0.2.*
 
 # LLM
-anthropic==0.34.*
+openai==1.14.*
 
 # Rate limiting
 slowapi==0.1.*
