@@ -1,7 +1,8 @@
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    ANTHROPIC_API_KEY: str = "placeholder"
+    NVIDIA_API_KEY: str = "placeholder"
+    LLM_MODEL: str = "meta/llama-3.1-70b-instruct"
     JWT_SECRET_KEY: str = "secret"
     JWT_EXPIRY_HOURS: int = 24
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/admitai.db"
