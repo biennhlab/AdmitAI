@@ -33,6 +33,14 @@ class RAGChain:
         # Extract just the chunks for prompting (ignoring scores for simple generation)
         chunks = [result[0] for result in retrieved_results] if retrieved_results else []
         
+        # Log top-k chunks to terminal
+        print(f"\\n--- TOP {len(chunks)} CHUNKS RETRIEVED ---")
+        for i, chunk in enumerate(chunks):
+            chunk_id = getattr(chunk, 'chunk_id', 'unknown')
+            snippet = chunk.content[:150].replace('\\n', ' ') + "..." if hasattr(chunk, 'content') else 'N/A'
+            print(f"[Chunk {i+1}] ID: {chunk_id} | Preview: {snippet}")
+        print("-----------------------------------\\n")
+        
         # 2. Check for empty context
         if not chunks:
             return RAGResponse(

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AdmitAI - Trợ lý Tuyển sinh PTIT</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="chat-container">
+        <!-- Header -->
+        <header class="chat-header">
+            <div class="logo">
+                <i class="fa-solid fa-graduation-cap"></i>
+            </div>
+            <div class="header-info">
+                <h1>AdmitAI</h1>
+                <p>Trợ lý Tuyển sinh PTIT</p>
+            </div>
+        </header>
+
+        <!-- Chat Area -->
+        <main class="chat-area" id="chatArea">
+            <!-- Welcome Message -->
+            <div class="message bot-message">
+                <div class="message-avatar">
+                    <i class="fa-solid fa-robot"></i>
+                </div>
+                <div class="message-content">
+                    <p>Xin chào! Mình là AdmitAI, trợ lý ảo tư vấn tuyển sinh của Học viện Công nghệ Bưu chính Viễn thông (PTIT). Bạn cần hỗ trợ thông tin gì?</p>
+                </div>
+            </div>
+
+            <!-- Suggested Questions -->
+            <div class="suggested-questions" id="suggestedQuestions">
+                <button class="suggestion-btn" onclick="app.sendSuggestion('Cho mình biết điểm chuẩn ngành CNTT năm ngoái?')">Điểm chuẩn ngành CNTT?</button>
+                <button class="suggestion-btn" onclick="app.sendSuggestion('Học phí PTIT năm 2024 là bao nhiêu?')">Học phí năm 2024?</button>
+                <button class="suggestion-btn" onclick="app.sendSuggestion('Phương thức xét tuyển kết hợp là gì?')">Xét tuyển kết hợp?</button>
+            </div>
+            
+            <!-- Messages will be injected here -->
+        </main>
+
+        <!-- Input Area -->
+        <footer class="chat-input-area">
+            <form id="chatForm" onsubmit="app.handleSubmit(event)">
+                <input type="text" id="messageInput" placeholder="Nhập câu hỏi của bạn..." autocomplete="off">
+                <button type="submit" id="sendBtn" title="Gửi">
+                    <i class="fa-solid fa-paper-plane"></i>
+                </button>
+            </form>
+        </footer>
+    </div>
+
+    <!-- Template cho message của user -->
+    <template id="userMessageTemplate">
+        <div class="message user-message">
+            <div class="message-content">
+                <p class="text"></p>
+            </div>
+        </div>
+    </template>
+
+    <!-- Template cho message của bot -->
+    <template id="botMessageTemplate">
+        <div class="message bot-message">
+            <div class="message-avatar">
+                <i class="fa-solid fa-robot"></i>
+            </div>
+            <div class="message-content">
+                <div class="text"></div>
+                <div class="citations-container" style="display: none;">
+                    <button class="citations-toggle">
+                        <i class="fa-solid fa-book-open"></i> <span class="citation-count">0</span> Nguồn tham khảo
+                        <i class="fa-solid fa-chevron-down toggle-icon"></i>
+                    </button>
+                    <div class="citations-list"></div>
+                </div>
+                <div class="feedback-actions">
+                    <button class="feedback-btn positive" title="Hữu ích"><i class="fa-regular fa-thumbs-up"></i></button>
+                    <button class="feedback-btn negative" title="Không hữu ích"><i class="fa-regular fa-thumbs-down"></i></button>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <!-- Template cho loading state -->
+    <template id="typingTemplate">
+        <div class="message bot-message typing-indicator" id="typingIndicator">
+            <div class="message-avatar">
+                <i class="fa-solid fa-robot"></i>
+            </div>
+            <div class="message-content">
+                <div class="typing-dots">
+                    <span></span><span></span><span></span>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <script src="app.js"></script>
+</body>
+</html>
