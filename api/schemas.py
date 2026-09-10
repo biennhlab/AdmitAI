@@ -1,11 +1,20 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Literal, Any
 from datetime import datetime
 
 class Citation(BaseModel):
     source: str
-    page: Optional[int]
-    snippet: str
+    title: Optional[str] = None
+    source_url: Optional[str] = None
+    source_type: Optional[str] = None
+    doc_id: Optional[str] = None
+    chunk_id: Optional[str] = None
+    page: Optional[int] = None
+    section: Optional[str] = None
+    snippet: str = ""
+    score: Optional[float] = None
+    published_at: Optional[str] = None
+    retrieved_at: Optional[str] = None
 
 class ChatRequest(BaseModel):
     message: str
@@ -13,7 +22,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    citations: List[Citation] = []
+    citations: List[Citation] = Field(default_factory=list)
     route_type: Optional[str] = None
     session_id: str
 

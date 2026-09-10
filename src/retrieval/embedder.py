@@ -10,7 +10,12 @@ class Embedder:
         Loads model from config by default.
         """
         self.model_name = model_name or settings.EMBEDDING_MODEL
-        self.model = SentenceTransformer(self.model_name)
+        # Prefer the local Hugging Face cache so API startup is deterministic
+        # and does not make a network HEAD request after the model was ingested.
+        try:
+            self.model = SentenceTransformer(self.model_name, local_files_only=True)
+        except (OSError, ValueError):
+            self.model = SentenceTransformer(self.model_name)
 
     def embed(self, texts: List[str]) -> np.ndarray:
         """

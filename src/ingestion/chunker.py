@@ -8,7 +8,12 @@ class Chunk:
     content: str
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-def naive_chunk(text: str, chunk_size: int = 500, overlap: int = 100) -> List[Chunk]:
+def naive_chunk(
+    text: str,
+    chunk_size: int = 500,
+    overlap: int = 100,
+    metadata: Dict[str, Any] | None = None,
+) -> List[Chunk]:
     """
     Splits text into chunks of `chunk_size` characters with an `overlap`.
     """
@@ -29,13 +34,21 @@ def naive_chunk(text: str, chunk_size: int = 500, overlap: int = 100) -> List[Ch
         if not content.strip():
             continue
             
-        # Create a stable chunk ID using hash
-        chunk_id = hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]
+        chunk_metadata = dict(metadata or {})
+        chunk_metadata["chunk_index"] = len(chunks)
+        identity = "\x1f".join(
+            [
+                str(chunk_metadata.get("doc_id", "")),
+                str(chunk_metadata["chunk_index"]),
+                content,
+            ]
+        )
+        chunk_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         
         chunk = Chunk(
             chunk_id=chunk_id,
             content=content,
-            metadata={"chunk_index": len(chunks)}
+            metadata=chunk_metadata,
         )
         chunks.append(chunk)
         

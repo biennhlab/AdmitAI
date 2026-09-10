@@ -32,6 +32,8 @@ MANIFEST
 *.manifest
 *.spec
 
+data
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
@@ -226,6 +228,7 @@ venv/
 .pytest_cache/
 eval_results/
 data/raw/
+data/index/
 *.pyc
 
 docs/acquired_knowledge
