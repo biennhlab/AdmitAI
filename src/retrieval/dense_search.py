@@ -1,17 +1,38 @@
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from src.ingestion.chunker import Chunk
 from src.retrieval.embedder import Embedder
 
+
+def chunk_embedding_text(chunk: Chunk) -> str:
+    """Include citation metadata that carries retrieval meaning, not payload IDs."""
+    metadata = chunk.metadata or {}
+    prefix = "\n".join(
+        value
+        for value in [str(metadata.get("title") or ""), str(metadata.get("section") or "")]
+        if value
+    )
+    return f"{prefix}\n{chunk.content}" if prefix else chunk.content
+
 class NaiveDenseSearch:
-    def __init__(self, embedder: Embedder, chunks: List[Chunk]):
+    def __init__(
+        self,
+        embedder: Embedder,
+        chunks: List[Chunk],
+        chunk_embeddings: Optional[np.ndarray] = None,
+    ):
         """
         Initialize search by embedding all chunks in-memory.
         """
         self.embedder = embedder
         self.chunks = chunks
-        if chunks:
-            texts = [chunk.content for chunk in chunks]
+        if chunk_embeddings is not None:
+            matrix = np.asarray(chunk_embeddings)
+            if matrix.ndim != 2 or matrix.shape[0] != len(chunks):
+                raise ValueError("Precomputed embeddings must align with chunks")
+            self.chunk_embeddings = matrix
+        elif chunks:
+            texts = [chunk_embedding_text(chunk) for chunk in chunks]
             self.chunk_embeddings = self.embedder.embed(texts)
         else:
             self.chunk_embeddings = np.array([])
@@ -29,10 +50,11 @@ class NaiveDenseSearch:
         if norm_a == 0 or norm_b == 0:
             return 0.0
             
-        sim = float(np.dot(a, b) / (norm_a * norm_b))
+        with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+            sim = float(np.dot(a, b) / (norm_a * norm_b))
         
         # Handle potential numerical precision issues leading to NaN
-        if np.isnan(sim):
+        if not np.isfinite(sim):
             return 0.0
             
         return sim
@@ -62,10 +84,18 @@ class NaiveDenseSearch:
         # Ensure we don't return more results than we have chunks
         actual_top_k = min(top_k, len(self.chunks))
         
-        results = []
-        for i, chunk_emb in enumerate(self.chunk_embeddings):
-            score = self.cosine_similarity(query_emb, chunk_emb)
-            results.append((self.chunks[i], score))
+        matrix = self.chunk_embeddings
+        row_norms = np.linalg.norm(matrix, axis=1)
+        query_norm = np.linalg.norm(query_emb)
+        denominator = row_norms * query_norm
+        scores = np.divide(
+            matrix @ query_emb,
+            denominator,
+            out=np.zeros_like(row_norms, dtype=float),
+            where=denominator != 0,
+        )
+        scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        results = [(self.chunks[i], float(score)) for i, score in enumerate(scores)]
             
         # Sort by score descending
         results.sort(key=lambda x: x[1], reverse=True)

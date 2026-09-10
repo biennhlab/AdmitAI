@@ -1,4 +1,4 @@
-const API_URL = 'http://localhost:8000/api/chat';
+const API_URL = '/api/chat';
 
 class ChatApp {
     constructor() {
@@ -70,9 +70,8 @@ class ChatApp {
             msgDiv.classList.add('error');
         }
         
-        // Use innerHTML for simple formatting (replace newlines with <br>)
-        // In a real app, use a markdown parser
-        node.querySelector('.text').innerHTML = text.replace(/\n/g, '<br>');
+        // textContent prevents an answer or retrieved document from injecting HTML.
+        node.querySelector('.text').textContent = text;
         
         // Handle citations
         if (citations && citations.length > 0) {
@@ -84,11 +83,36 @@ class ChatApp {
             citContainer.style.display = 'block';
             citCount.textContent = citations.length;
             
-            citations.forEach(c => {
-                const p = document.createElement('p');
-                p.className = 'citation-item';
-                p.textContent = `• ${c.source || 'Tài liệu tuyển sinh'}`;
-                citList.appendChild(p);
+            citations.forEach((c, index) => {
+                const item = document.createElement('div');
+                item.className = 'citation-item';
+                const label = c.title || c.source || 'Tài liệu tuyển sinh PTIT';
+                const link = document.createElement(c.source_url ? 'a' : 'span');
+                link.textContent = `[${index + 1}] ${label}`;
+                if (c.source_url) {
+                    link.href = c.source_url;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                }
+                item.appendChild(link);
+
+                const location = [
+                    c.page ? `Trang ${c.page}` : '',
+                    c.section && c.section !== `Trang ${c.page}` ? c.section : ''
+                ].filter(Boolean).join(' · ');
+                if (location) {
+                    const meta = document.createElement('div');
+                    meta.className = 'citation-location';
+                    meta.textContent = location;
+                    item.appendChild(meta);
+                }
+                if (c.snippet) {
+                    const snippet = document.createElement('div');
+                    snippet.className = 'citation-snippet';
+                    snippet.textContent = c.snippet;
+                    item.appendChild(snippet);
+                }
+                citList.appendChild(item);
             });
             
             toggleBtn.addEventListener('click', (e) => {

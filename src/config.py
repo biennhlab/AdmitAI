@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     RERANK_TOP_K: int = 5
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 100
+    EMBEDDING_BATCH_SIZE: int = 32
+    INDEX_DIR: str = "data/index/naive_dense"
+    RETRIEVAL_MIN_SCORE: float = 0.68
+    RETRIEVAL_MIN_LEXICAL_COVERAGE: float = 0.50
 
     class Config:
         env_file = ".env"

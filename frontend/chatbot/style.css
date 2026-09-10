@@ -132,6 +132,11 @@ body {
     word-wrap: break-word;
 }
 
+.message-content .text {
+    white-space: pre-wrap;
+    line-height: 1.5;
+}
+
 .user-message {
     align-self: flex-end;
     flex-direction: row-reverse;
@@ -227,8 +232,30 @@ body {
 }
 
 .citation-item {
-    margin-bottom: 4px;
+    margin-bottom: 10px;
     color: var(--text-muted);
+}
+
+.citation-item a {
+    color: var(--primary-color);
+    font-weight: 500;
+    text-decoration: none;
+}
+
+.citation-item a:hover {
+    text-decoration: underline;
+}
+
+.citation-location {
+    margin-top: 2px;
+    font-size: 0.8rem;
+}
+
+.citation-snippet {
+    margin-top: 3px;
+    color: var(--bot-msg-text);
+    font-size: 0.8rem;
+    line-height: 1.35;
 }
 
 /* Feedback */

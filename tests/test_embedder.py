@@ -24,12 +24,12 @@ def test_embedder_initialization(mock_sentence_transformer):
     with patch("src.retrieval.embedder.settings") as mock_settings:
         mock_settings.EMBEDDING_MODEL = "test-model"
         embedder = Embedder()
-        mock_sentence_transformer.assert_called_once_with("test-model")
+        mock_sentence_transformer.assert_called_once_with("test-model", local_files_only=True)
         
     # Should use provided model
     mock_sentence_transformer.reset_mock()
     embedder = Embedder(model_name="custom-model")
-    mock_sentence_transformer.assert_called_once_with("custom-model")
+    mock_sentence_transformer.assert_called_once_with("custom-model", local_files_only=True)
 
 def test_embed_empty_list(mock_sentence_transformer):
     embedder = Embedder("dummy")

@@ -59,7 +59,7 @@ def test_build_rag_prompt_and_format_citations():
     assert len(messages) == 1
     assert messages[0]["role"] == "user"
     assert "What is A?" in messages[0]["content"]
-    assert "doc1.pdf" in messages[0]["content"]
+    assert "doc1.pdf" not in messages[0]["content"]
 
 def test_session_memory_basic():
     mem = SessionMemory()
@@ -107,19 +107,20 @@ def test_rag_chain_answer_order():
     
     chain = RAGChain(retriever, mock_llm)
     
-    response = chain.answer("Question?")
+    response = chain.answer("Info?")
     
     assert response.answer == "Answer generated"
-    assert "file.pdf" in response.citations
+    assert response.citations[0]["source"] == "file.pdf"
     assert response.route_type == "general"
     
     mock_llm.generate.assert_called_once()
     
     call_kwargs = mock_llm.generate.call_args[1]
-    assert call_kwargs["system_prompt"] == SYSTEM_PROMPT
+    assert "file.pdf" in call_kwargs["system_prompt"]
+    assert "Info" in call_kwargs["system_prompt"]
     assert len(call_kwargs["messages"]) == 1
-    assert "Question?" in call_kwargs["messages"][0]["content"]
-    assert "file.pdf" in call_kwargs["messages"][0]["content"]
+    assert "Info?" in call_kwargs["messages"][0]["content"]
+    assert "file.pdf" not in call_kwargs["messages"][0]["content"]
 
 def test_rag_chain_empty_context():
     retriever = MockRetriever([])
@@ -130,7 +131,7 @@ def test_rag_chain_empty_context():
     
     # LLM should not be called
     mock_llm.generate.assert_not_called()
-    assert "Xin lỗi" in response.answer
+    assert "chưa tìm thấy" in response.answer
     assert "tuyển sinh" in response.answer
     assert len(response.citations) == 0
 
@@ -143,5 +144,5 @@ def test_rag_chain_empty_question():
     chain = RAGChain(retriever, mock_llm)
     chain.answer("")
     
-    # Question is empty, should still call retriever (maybe return empty) and LLM
-    mock_llm.generate.assert_called_once()
+    # Invalid input must not spend an LLM call or fabricate an answer.
+    mock_llm.generate.assert_not_called()
