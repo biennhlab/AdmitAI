@@ -77,3 +77,66 @@ def test_parse_pdf_mock():
         assert pages[1].text == "Page 2 content"
         assert pages[2].page_number == 3
         assert pages[2].text == ""
+
+def test_parse_pdf_extract_features():
+    with patch("src.ingestion.parser.pdfplumber.open") as mock_open:
+        mock_pdf = MagicMock()
+        mock_page = MagicMock()
+        mock_page.page_number = 1
+        mock_page.extract_text.return_value = "Test Document\nĐiều 1. Test Heading"
+        
+        # Mock table extraction
+        mock_page.extract_tables.return_value = [
+            [["Header 1", "Header 2"], ["Val 1", "Val 2"]],
+            [["", None], ["Skip", "Me"]]
+        ]
+        
+        # Mock words with sizes for heading heuristic
+        mock_page.extract_words.return_value = [
+            {"text": "Test", "size": 12.0, "top": 10.0, "bottom": 22.0, "x0": 5.0, "x1": 20.0},
+            {"text": "Document", "size": 12.0, "top": 10.0, "bottom": 22.0, "x0": 25.0, "x1": 50.0},
+            {"text": "Điều", "size": 18.0, "top": 50.0, "bottom": 68.0, "x0": 5.0, "x1": 25.0},
+            {"text": "1.", "size": 18.0, "top": 50.0, "bottom": 68.0, "x0": 30.0, "x1": 40.0},
+            {"text": "Test", "size": 18.0, "top": 50.0, "bottom": 68.0, "x0": 45.0, "x1": 60.0},
+            {"text": "Heading", "size": 18.0, "top": 50.0, "bottom": 68.0, "x0": 65.0, "x1": 90.0}
+        ]
+        
+        mock_pdf.pages = [mock_page]
+        mock_context = MagicMock()
+        mock_context.__enter__.return_value = mock_pdf
+        mock_open.return_value = mock_context
+        
+        pages = parse_pdf("dummy.pdf")
+        assert len(pages) == 1
+        page = pages[0]
+        
+        # Test Tables
+        assert len(page.tables) == 2
+        assert page.tables[0].rows == [["Header 1", "Header 2"], ["Val 1", "Val 2"]]
+        assert page.tables[1].rows == [["Skip", "Me"]]
+        
+        # Test Headings
+        assert len(page.headings) > 0
+        heading = page.headings[-1]
+        assert heading.text == "Điều 1. Test Heading"
+        
+def test_parse_pdf_graceful_degradation():
+    with patch("src.ingestion.parser.pdfplumber.open") as mock_open:
+        mock_pdf = MagicMock()
+        mock_page = MagicMock()
+        mock_page.page_number = 1
+        mock_page.extract_text.return_value = "Content"
+        
+        # Simulate crash in extract_tables
+        mock_page.extract_tables.side_effect = Exception("Simulated crash")
+        mock_page.extract_words.return_value = []
+        
+        mock_pdf.pages = [mock_page]
+        mock_context = MagicMock()
+        mock_context.__enter__.return_value = mock_pdf
+        mock_open.return_value = mock_context
+        
+        pages = parse_pdf("dummy.pdf")
+        assert len(pages) == 1
+        assert pages[0].text == "Content"
+        assert len(pages[0].tables) == 0

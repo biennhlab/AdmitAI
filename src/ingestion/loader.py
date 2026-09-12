@@ -11,7 +11,7 @@ from typing import Any, Iterable
 
 from bs4 import BeautifulSoup
 
-from .parser import parse_pdf
+from .parser import Heading, ParsedPage, Table, parse_pdf
 
 
 @dataclass
@@ -20,6 +20,7 @@ class LoadedDocument:
     content: str
     metadata: dict[str, Any]
     file_path: str
+    pages: list[ParsedPage] = field(default_factory=list)
 
 
 @dataclass
@@ -44,6 +45,60 @@ def _parse_scalar(value: str) -> Any:
     if value.lower() in {"true", "false"}:
         return value.lower() == "true"
     return value
+
+
+def _markdown_row(line: str) -> list[str] | None:
+    stripped = line.strip()
+    if not (stripped.startswith("|") and stripped.endswith("|")):
+        return None
+    return [cell.replace("\\|", "|").strip() for cell in stripped[1:-1].split("|")]
+
+
+def _is_markdown_separator(row: list[str]) -> bool:
+    return bool(row) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in row)
+
+
+def _parse_markdown_page(content: str, page_number: int) -> ParsedPage:
+    """Restore headings/tables from canonical processed Markdown for Module 2."""
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    headings: list[Heading] = []
+    tables: list[Table] = []
+    text_lines: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        heading_match = re.match(r"^\s*(#{1,6})\s+(.+?)\s*$", lines[index])
+        if heading_match:
+            heading_text = heading_match.group(2).strip()
+            headings.append(Heading(heading_text, len(heading_match.group(1)), page_number))
+            text_lines.append(heading_text)
+            index += 1
+            continue
+
+        first_row = _markdown_row(lines[index])
+        second_row = _markdown_row(lines[index + 1]) if index + 1 < len(lines) else None
+        if first_row is not None and second_row is not None and _is_markdown_separator(second_row):
+            rows = [first_row]
+            table_lines = [lines[index], lines[index + 1]]
+            index += 2
+            while index < len(lines):
+                row = _markdown_row(lines[index])
+                if row is None:
+                    break
+                if not _is_markdown_separator(row):
+                    rows.append(row)
+                table_lines.append(lines[index])
+                index += 1
+            tables.append(Table(rows=rows, page_number=page_number))
+            # Keep the source position available to table-aware chunking. The
+            # combined strategy removes these rows before creating text chunks.
+            text_lines.extend(table_lines)
+            continue
+
+        text_lines.append(lines[index])
+        index += 1
+
+    return ParsedPage(page_number, "\n".join(text_lines).strip(), tables=tables, headings=headings)
 
 
 def parse_markdown_document(path: Path) -> LoadedDocument:
@@ -76,7 +131,12 @@ def parse_markdown_document(path: Path) -> LoadedDocument:
     metadata.setdefault("retrieved_at", "")
     metadata.setdefault("section", "Toàn văn")
     metadata.setdefault("content_hash", hashlib.sha256(content.encode("utf-8")).hexdigest())
-    return LoadedDocument(doc_id, content, metadata, str(path))
+    try:
+        page_number = int(metadata.get("page_number") or 1)
+    except (TypeError, ValueError):
+        page_number = 1
+    pages = [_parse_markdown_page(content, page_number)]
+    return LoadedDocument(doc_id, content, metadata, str(path), pages=pages)
 
 
 def _find_processed_dir(requested: Path) -> Path | None:
@@ -162,7 +222,7 @@ def _load_raw(raw_dir: Path) -> LoadResult:
                         "section": f"Trang {page.page_number}",
                         "content_hash": hashlib.sha256(page.text.encode("utf-8")).hexdigest(),
                     }
-                    result.documents.append(LoadedDocument(doc_id, page.text, metadata, str(path)))
+                    result.documents.append(LoadedDocument(doc_id, page.text, metadata, str(path), pages=[page]))
             else:
                 soup = BeautifulSoup(path.read_text(encoding="utf-8", errors="replace"), "html.parser")
                 for tag in soup(["script", "style", "noscript"]):
@@ -175,7 +235,15 @@ def _load_raw(raw_dir: Path) -> LoadResult:
                     "section": "Toàn văn",
                     "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 }
-                result.documents.append(LoadedDocument(base_doc_id, content, metadata, str(path)))
+                result.documents.append(
+                    LoadedDocument(
+                        base_doc_id,
+                        content,
+                        metadata,
+                        str(path),
+                        pages=[ParsedPage(page_number=1, text=content)],
+                    )
+                )
         except Exception as exc:
             result.errors.append({"file": str(path), "error": str(exc)})
     return result

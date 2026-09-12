@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     RERANK_TOP_K: int = 5
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 100
+    TABLE_CHUNK_SIZE: int = 500
+    PARENT_CHUNK_SIZE: int = 1500
+    CHILD_CHUNK_SIZE: int = 300
     EMBEDDING_BATCH_SIZE: int = 32
     INDEX_DIR: str = "data/index/naive_dense"
     RETRIEVAL_MIN_SCORE: float = 0.68
