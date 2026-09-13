@@ -16,24 +16,31 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import settings
-from src.ingestion import Chunk, load_documents, naive_chunk
+from src.ingestion import Chunk, ParsedPage, combined_chunk, load_documents, naive_chunk
 from src.retrieval import Embedder, read_manifest, save_dense_index
 from src.retrieval.dense_search import chunk_embedding_text
 
 
 def corpus_fingerprint(documents: list, module: int) -> str:
     digest = hashlib.sha256()
-    digest.update(
-        json.dumps(
+    chunking_config = {
+        "module": module,
+        "embedding_model": settings.EMBEDDING_MODEL,
+        "chunk_size": settings.CHUNK_SIZE,
+        "chunk_overlap": settings.CHUNK_OVERLAP,
+        "embedding_input": "title_section_content_v1",
+    }
+    if module == 2:
+        chunking_config.update(
             {
-                "module": module,
-                "embedding_model": settings.EMBEDDING_MODEL,
-                "chunk_size": settings.CHUNK_SIZE,
-                "chunk_overlap": settings.CHUNK_OVERLAP,
-                "embedding_input": "title_section_content_v1",
-            },
-            sort_keys=True,
-        ).encode()
+                "table_chunk_size": settings.TABLE_CHUNK_SIZE,
+                "parent_chunk_size": settings.PARENT_CHUNK_SIZE,
+                "child_chunk_size": settings.CHILD_CHUNK_SIZE,
+                "chunking_strategy": "combined_v2",
+            }
+        )
+    digest.update(
+        json.dumps(chunking_config, sort_keys=True).encode()
     )
     for document in documents:
         digest.update(document.doc_id.encode("utf-8"))
@@ -45,19 +52,42 @@ def corpus_fingerprint(documents: list, module: int) -> str:
     return digest.hexdigest()
 
 
-def build_chunks(documents: list) -> tuple[list[Chunk], list[dict[str, str]]]:
+def build_chunks(
+    documents: list,
+    module: int = 1,
+    parent_store: list[Chunk] | None = None,
+) -> tuple[list[Chunk], list[dict[str, str]]]:
+    if module not in {1, 2}:
+        raise ValueError("module must be 1 (naive) or 2 (advanced chunking)")
     chunks: list[Chunk] = []
     errors: list[dict[str, str]] = []
     for document in documents:
         try:
             metadata = dict(document.metadata)
             metadata["doc_id"] = document.doc_id
-            document_chunks = naive_chunk(
-                document.content,
-                chunk_size=settings.CHUNK_SIZE,
-                overlap=settings.CHUNK_OVERLAP,
-                metadata=metadata,
-            )
+            if module == 1:
+                document_chunks = naive_chunk(
+                    document.content,
+                    chunk_size=settings.CHUNK_SIZE,
+                    overlap=settings.CHUNK_OVERLAP,
+                    metadata=metadata,
+                )
+            else:
+                pages = list(getattr(document, "pages", []) or [])
+                if not pages:
+                    page_number = int(metadata.get("page_number") or 1)
+                    pages = [ParsedPage(page_number=page_number, text=document.content)]
+                document_parents: list[Chunk] = []
+                document_chunks = combined_chunk(
+                    pages,
+                    max_size=settings.TABLE_CHUNK_SIZE,
+                    parent_size=settings.PARENT_CHUNK_SIZE,
+                    child_size=settings.CHILD_CHUNK_SIZE,
+                    metadata=metadata,
+                    parent_chunks=document_parents,
+                )
+                if parent_store is not None:
+                    parent_store.extend(document_parents)
             for chunk in document_chunks:
                 chunk.metadata["document_chunk_count"] = len(document_chunks)
             chunks.extend(document_chunks)
@@ -98,14 +128,18 @@ def embed_chunks(embedder: Embedder, chunks: list[Chunk]) -> tuple[list[Chunk], 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest crawled PTIT data into the Phase-1 dense index")
     parser.add_argument("--data-dir", default="data/processed", help="Processed data or raw fallback directory")
-    parser.add_argument("--module", type=int, default=1, help="Implementation-plan module (currently 1)")
+    parser.add_argument(
+        "--module",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Chunking module: 1=naive fixed-size, 2=combined advanced chunking",
+    )
     parser.add_argument("--index-dir", default=settings.INDEX_DIR)
     parser.add_argument("--force", action="store_true", help="Re-embed even when the corpus is unchanged")
     args = parser.parse_args()
-    if args.module != 1:
-        parser.error("This codebase is currently at Module 1; only naive dense ingestion is canonical")
-
     load_result = load_documents(args.data_dir, prefer_processed=True)
+    page_count = sum(len(getattr(document, "pages", []) or []) or 1 for document in load_result.documents)
     fingerprint = corpus_fingerprint(load_result.documents, args.module)
     existing = read_manifest(args.index_dir)
     if (
@@ -120,7 +154,11 @@ def main() -> int:
                     "status": "unchanged",
                     "source_dir": load_result.source_dir,
                     "documents": existing.get("document_count"),
+                    "pages": existing.get("page_count", page_count),
                     "chunks": existing.get("chunk_count"),
+                    "table_chunks": existing.get("table_chunk_count", 0),
+                    "parent_chunks": existing.get("parent_chunk_count", 0),
+                    "child_chunks": existing.get("child_chunk_count", 0),
                     "index_dir": str(Path(args.index_dir).resolve()),
                     "skipped_duplicates": len(load_result.skipped_duplicates),
                     "load_errors": load_result.errors,
@@ -131,10 +169,17 @@ def main() -> int:
         )
         return 0
 
-    chunks, chunk_errors = build_chunks(load_result.documents)
+    parent_chunks: list[Chunk] = []
+    chunks, chunk_errors = build_chunks(load_result.documents, args.module, parent_chunks)
     if not chunks:
         raise RuntimeError("No chunks were produced; refusing to replace the existing index")
-    print(f"Loaded {len(load_result.documents)} documents and produced {len(chunks)} chunks")
+    table_chunk_count = sum(chunk.metadata.get("chunk_type") == "table" for chunk in chunks)
+    child_chunk_count = sum(chunk.metadata.get("chunk_type") == "child" for chunk in chunks)
+    print(
+        f"Loaded {len(load_result.documents)} documents / {page_count} pages; "
+        f"produced {len(chunks)} chunks ({table_chunk_count} table, "
+        f"{len(parent_chunks)} parent stored separately, {child_chunk_count} child)"
+    )
     embedder = Embedder(settings.EMBEDDING_MODEL)
     indexed_chunks, embeddings, embedding_errors = embed_chunks(embedder, chunks)
     if not indexed_chunks:
@@ -155,6 +200,18 @@ def main() -> int:
             "embedding_input": "title_section_content_v1",
             "corpus_fingerprint": fingerprint,
             "document_count": len(indexed_doc_ids),
+            "page_count": page_count,
+            "table_chunk_count": sum(
+                chunk.metadata.get("chunk_type") == "table" for chunk in indexed_chunks
+            ),
+            "parent_chunk_count": len(parent_chunks),
+            "child_chunk_count": sum(
+                chunk.metadata.get("chunk_type") == "child" for chunk in indexed_chunks
+            ),
+            "parent_chunks": [
+                {"chunk_id": chunk.chunk_id, "content": chunk.content, "metadata": chunk.metadata}
+                for chunk in parent_chunks
+            ],
             "load_errors": load_result.errors,
             "chunk_errors": chunk_errors,
             "embedding_errors": embedding_errors,
@@ -167,7 +224,11 @@ def main() -> int:
                 "status": "indexed",
                 "source_dir": load_result.source_dir,
                 "documents": manifest["document_count"],
+                "pages": manifest["page_count"],
                 "chunks": manifest["chunk_count"],
+                "table_chunks": manifest["table_chunk_count"],
+                "parent_chunks": manifest["parent_chunk_count"],
+                "child_chunks": manifest["child_chunk_count"],
                 "embedding_dimension": manifest["embedding_dimension"],
                 "index_dir": str(Path(args.index_dir).resolve()),
                 "errors": len(load_result.errors) + len(chunk_errors) + len(embedding_errors),

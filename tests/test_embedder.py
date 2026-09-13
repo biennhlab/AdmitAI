@@ -77,3 +77,35 @@ def test_embed_query_invalid(mock_sentence_transformer):
         
     with pytest.raises(ValueError, match="Query cannot be empty"):
         embedder.embed_query(None)
+
+
+def test_model_is_reused_within_process(mock_sentence_transformer):
+    first = Embedder("shared-test-model")
+    second = Embedder("shared-test-model")
+
+    assert first.model is second.model
+    mock_sentence_transformer.assert_called_once_with(
+        "shared-test-model", local_files_only=True
+    )
+
+
+def test_embed_rejects_invalid_items_and_dimension_changes(mock_sentence_transformer):
+    embedder = Embedder("validation-test-model")
+
+    with pytest.raises(TypeError, match="single string"):
+        embedder.embed("not a list")
+    with pytest.raises(ValueError, match=r"texts\[1\]"):
+        embedder.embed(["valid", "   "])
+
+    embedder.model.encode.side_effect = lambda value, **kwargs: np.ones((len(value), 2))
+    assert embedder.embed(["first"]).shape == (1, 2)
+    embedder.model.encode.side_effect = lambda value, **kwargs: np.ones((len(value), 3))
+    with pytest.raises(ValueError, match="dimension changed"):
+        embedder.embed(["second"])
+
+
+def test_embed_rejects_non_finite_output(mock_sentence_transformer):
+    embedder = Embedder("non-finite-test-model")
+    embedder.model.encode.side_effect = lambda value, **kwargs: np.array([[np.nan, 1.0]])
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        embedder.embed(["xin chào"])
