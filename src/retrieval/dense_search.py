@@ -119,13 +119,11 @@ _PAYLOAD_RESERVED_KEYS = {"chunk_id", "content", "metadata"}
 class QdrantDenseSearch:
     """Dense retrieval backed by one unnamed Qdrant cosine vector."""
 
-    def __init__(self, qdrant_client: Any, collection: str, embedder: Embedder):
+    def __init__(self, qdrant_client: Any, collection: str, embedder: Embedder | None):
         if qdrant_client is None:
             raise ValueError("qdrant_client is required")
         if not isinstance(collection, str) or not collection.strip():
             raise ValueError("collection must be a non-empty string")
-        if embedder is None:
-            raise ValueError("embedder is required")
         self.qdrant_client = qdrant_client
         self.collection = collection.strip()
         self.embedder = embedder
@@ -204,6 +202,12 @@ class QdrantDenseSearch:
                 ) from exc
         self._validate_collection(vector_size)
 
+    def validate_ready(self, vector_size: int) -> None:
+        """Fail clearly unless the configured collection can serve this vector size."""
+        if not self._collection_exists():
+            raise RuntimeError(f"Qdrant collection '{self.collection}' does not exist")
+        self._validate_collection(vector_size)
+
     @staticmethod
     def _validate_matrix(vectors: Any, chunk_count: int) -> np.ndarray:
         matrix = np.asarray(vectors, dtype=np.float32)
@@ -218,8 +222,8 @@ class QdrantDenseSearch:
             raise ValueError("Embedding matrix contains a zero vector")
         return matrix
 
-    def index(self, chunks: list[Chunk]) -> None:
-        """Embed and idempotently upsert chunks, preserving citation metadata."""
+    def index(self, chunks: list[Chunk], embeddings: Any = None) -> None:
+        """Idempotently upsert chunks, optionally using precomputed embeddings."""
         if chunks is None:
             raise TypeError("chunks cannot be None")
         chunks = list(chunks)
@@ -240,10 +244,13 @@ class QdrantDenseSearch:
             if chunk.metadata is None or not isinstance(chunk.metadata, Mapping):
                 raise TypeError(f"chunks[{index}].metadata must be a mapping")
 
-        matrix = self._validate_matrix(
-            self.embedder.embed([chunk.content for chunk in chunks]),
-            len(chunks),
-        )
+        if embeddings is None:
+            if self.embedder is None:
+                raise ValueError("embedder is required when embeddings are not provided")
+            vectors = self.embedder.embed([chunk.content for chunk in chunks])
+        else:
+            vectors = embeddings
+        matrix = self._validate_matrix(vectors, len(chunks))
         self._ensure_collection(int(matrix.shape[1]))
 
         points: list[models.PointStruct] = []
@@ -380,6 +387,8 @@ class QdrantDenseSearch:
             return []
         if not self._collection_exists():
             return []
+        if self.embedder is None:
+            raise RuntimeError("embedder is required for dense search")
 
         vector = np.asarray(self.embedder.embed_query(query), dtype=np.float32)
         if vector.ndim != 1 or vector.size == 0:

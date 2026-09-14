@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+import math
 from numbers import Real
 from typing import Any
 
@@ -24,6 +25,8 @@ def reciprocal_rank_fusion(
     """Fuse ranked lists with ``1 / (k + rank)`` using one-based ranks."""
     if not isinstance(k, Real) or isinstance(k, bool):
         raise TypeError("k must be a real number")
+    if not math.isfinite(float(k)):
+        raise ValueError("k must be finite")
     if k < 0:
         raise ValueError("k must be greater than or equal to 0")
     if result_lists is None:
@@ -32,7 +35,8 @@ def reciprocal_rank_fusion(
     fused_scores: dict[str, float] = {}
     for result_list in result_lists:
         seen_in_list: set[str] = set()
-        for rank, item in enumerate(result_list, start=1):
+        unique_rank = 0
+        for item in result_list:
             try:
                 document, _original_score = item
             except (TypeError, ValueError) as exc:
@@ -43,8 +47,9 @@ def reciprocal_rank_fusion(
             if chunk_id in seen_in_list:
                 continue
             seen_in_list.add(chunk_id)
+            unique_rank += 1
             fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (
-                float(k) + rank
+                float(k) + unique_rank
             )
 
     # chunk_id is a stable tie-break independent of retriever/list insertion order.

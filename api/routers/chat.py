@@ -26,31 +26,55 @@ rag_manifest: dict[str, Any] | None = None
 rag_initialization_error: str | None = None
 
 
-def initialize_rag(index_dir: str | Path | None = None) -> dict[str, Any]:
-    """Load the persisted corpus and vectors once during application startup."""
+def initialize_rag(
+    index_dir: str | Path | None = None,
+    *,
+    retriever: Any | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create the process-wide RAG chain from a loaded or injected retriever."""
     global rag_chain, rag_manifest, rag_initialization_error
     try:
-        chunks, embeddings, manifest = load_dense_index(index_dir or settings.INDEX_DIR)
-        indexed_model = manifest.get("embedding_model")
+        is_injected = retriever is not None
+        if is_injected:
+            if manifest is None:
+                raise ValueError("manifest is required when injecting a retriever")
+            loaded_manifest = manifest
+        else:
+            chunks, embeddings, loaded_manifest = load_dense_index(
+                index_dir or settings.INDEX_DIR
+            )
+            embedder = Embedder(model_name=settings.EMBEDDING_MODEL)
+            retriever = NaiveDenseSearch(
+                embedder,
+                chunks,
+                chunk_embeddings=embeddings,
+            )
+
+        indexed_model = loaded_manifest.get("embedding_model")
         if indexed_model != settings.EMBEDDING_MODEL:
             raise ValueError(
                 f"Index model '{indexed_model}' differs from configured model '{settings.EMBEDDING_MODEL}'. "
                 "Run scripts/ingest.py again."
             )
-        embedder = Embedder(model_name=settings.EMBEDDING_MODEL)
-        retriever = NaiveDenseSearch(embedder, chunks, chunk_embeddings=embeddings)
         llm_client = LLMClient(api_key=settings.NVIDIA_API_KEY, model=settings.LLM_MODEL)
         rag_chain = RAGChain(
             retriever,
             llm_client,
-            top_k=min(5, settings.RETRIEVAL_TOP_K),
-            min_score=settings.RETRIEVAL_MIN_SCORE,
+            top_k=settings.RETRIEVAL_TOP_K,
+            # Dense cosine thresholds are not meaningful for RRF scores.
+            min_score=None if is_injected else settings.RETRIEVAL_MIN_SCORE,
             min_lexical_coverage=settings.RETRIEVAL_MIN_LEXICAL_COVERAGE,
         )
-        rag_manifest = manifest
+        rag_manifest = loaded_manifest
         rag_initialization_error = None
-        logger.info("RAG ready: %s documents, %s chunks", manifest["document_count"], manifest["chunk_count"])
-        return manifest
+        logger.info(
+            "RAG ready: %s documents, %s chunks, backend=%s",
+            loaded_manifest["document_count"],
+            loaded_manifest["chunk_count"],
+            loaded_manifest.get("retrieval_backend", loaded_manifest.get("backend")),
+        )
+        return loaded_manifest
     except Exception as exc:
         rag_chain = None
         rag_manifest = None
@@ -59,11 +83,23 @@ def initialize_rag(index_dir: str | Path | None = None) -> dict[str, Any]:
         raise
 
 
+def mark_rag_unavailable(exc: Exception) -> None:
+    """Expose startup failures through health and chat responses."""
+    global rag_chain, rag_manifest, rag_initialization_error
+    rag_chain = None
+    rag_manifest = None
+    rag_initialization_error = str(exc)
+
+
 def rag_status() -> dict[str, Any]:
     return {
         "ready": rag_chain is not None,
         "error": rag_initialization_error,
-        "backend": rag_manifest.get("backend") if rag_manifest else None,
+        "backend": (
+            rag_manifest.get("retrieval_backend", rag_manifest.get("backend"))
+            if rag_manifest
+            else None
+        ),
         "documents": rag_manifest.get("document_count") if rag_manifest else 0,
         "chunks": rag_manifest.get("chunk_count") if rag_manifest else 0,
         "embedding_model": rag_manifest.get("embedding_model") if rag_manifest else None,

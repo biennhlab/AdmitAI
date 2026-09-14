@@ -1,4 +1,4 @@
-"""Build the canonical Phase-1 dense index from crawled PTIT data."""
+"""Build the configured retrieval index from crawled PTIT data."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+from qdrant_client import QdrantClient
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -17,7 +18,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.config import settings
 from src.ingestion import Chunk, ParsedPage, combined_chunk, load_documents, naive_chunk
-from src.retrieval import Embedder, read_manifest, save_dense_index
+from src.retrieval import (
+    BM25Search,
+    Embedder,
+    QdrantDenseSearch,
+    load_dense_index,
+    read_manifest,
+    save_dense_index,
+)
 from src.retrieval.dense_search import chunk_embedding_text
 
 
@@ -30,7 +38,7 @@ def corpus_fingerprint(documents: list, module: int) -> str:
         "chunk_overlap": settings.CHUNK_OVERLAP,
         "embedding_input": "title_section_content_v1",
     }
-    if module == 2:
+    if module in {2, 3}:
         chunking_config.update(
             {
                 "table_chunk_size": settings.TABLE_CHUNK_SIZE,
@@ -57,8 +65,8 @@ def build_chunks(
     module: int = 1,
     parent_store: list[Chunk] | None = None,
 ) -> tuple[list[Chunk], list[dict[str, str]]]:
-    if module not in {1, 2}:
-        raise ValueError("module must be 1 (naive) or 2 (advanced chunking)")
+    if module not in {1, 2, 3}:
+        raise ValueError("module must be 1 (naive), 2 (advanced), or 3 (hybrid)")
     chunks: list[Chunk] = []
     errors: list[dict[str, str]] = []
     for document in documents:
@@ -125,15 +133,79 @@ def embed_chunks(embedder: Embedder, chunks: list[Chunk]) -> tuple[list[Chunk], 
     return successful_chunks, np.vstack(matrices), errors
 
 
+def build_hybrid_indexes(
+    chunks: list[Chunk],
+    embeddings: np.ndarray,
+    embedder: Embedder | None,
+    stale_chunk_ids: set[str] | None = None,
+) -> tuple[BM25Search, int]:
+    """Upsert dense vectors and validate the matching in-memory BM25 corpus."""
+    dense_search = QdrantDenseSearch(
+        QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT),
+        settings.QDRANT_COLLECTION,
+        embedder,
+    )
+    try:
+        # Reuse the vectors produced by embed_chunks: module 3 must not embed the
+        # same corpus a second time merely to hand it to Qdrant.
+        batch_size = max(1, settings.QDRANT_UPSERT_BATCH_SIZE)
+        total_batches = (len(chunks) + batch_size - 1) // batch_size
+        for batch_number, start in enumerate(range(0, len(chunks), batch_size), start=1):
+            batch_chunks = chunks[start : start + batch_size]
+            batch_embeddings = embeddings[start : start + batch_size]
+            dense_search.index(batch_chunks, embeddings=batch_embeddings)
+            if batch_number == 1 or batch_number == total_batches or batch_number % 10 == 0:
+                print(f"Qdrant upsert batch {batch_number}/{total_batches}", flush=True)
+        if stale_chunk_ids:
+            dense_search.qdrant_client.delete(
+                collection_name=settings.QDRANT_COLLECTION,
+                points_selector=[
+                    dense_search._point_id(chunk_id) for chunk_id in sorted(stale_chunk_ids)
+                ],
+                wait=True,
+            )
+        qdrant_count = dense_search.qdrant_client.count(
+            collection_name=settings.QDRANT_COLLECTION,
+            exact=True,
+        ).count
+    finally:
+        dense_search.qdrant_client.close()
+
+    sparse_search = BM25Search()
+    sparse_search.index(chunks)
+    return sparse_search, int(qdrant_count)
+
+
+def validate_unchanged_hybrid_index(index_dir: str | Path) -> tuple[dict, int] | None:
+    """Return an unchanged manifest only when both retrieval branches are ready."""
+    chunks, _embeddings, manifest = load_dense_index(index_dir)
+    sparse_search = BM25Search()
+    sparse_search.index(chunks)
+
+    client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
+    try:
+        if not client.collection_exists(settings.QDRANT_COLLECTION):
+            return None
+        qdrant_count = int(
+            client.count(collection_name=settings.QDRANT_COLLECTION, exact=True).count
+        )
+    finally:
+        client.close()
+
+    if qdrant_count != len(chunks):
+        return None
+    return manifest, len(sparse_search.chunks)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Ingest crawled PTIT data into the Phase-1 dense index")
+    parser = argparse.ArgumentParser(description="Ingest crawled PTIT data into the retrieval index")
     parser.add_argument("--data-dir", default="data/processed", help="Processed data or raw fallback directory")
     parser.add_argument(
         "--module",
         type=int,
-        choices=(1, 2),
+        choices=(1, 2, 3),
         default=1,
-        help="Chunking module: 1=naive fixed-size, 2=combined advanced chunking",
+        help="Module: 1=naive dense, 2=advanced dense, 3=Qdrant + BM25 hybrid",
     )
     parser.add_argument("--index-dir", default=settings.INDEX_DIR)
     parser.add_argument("--force", action="store_true", help="Re-embed even when the corpus is unchanged")
@@ -142,12 +214,41 @@ def main() -> int:
     page_count = sum(len(getattr(document, "pages", []) or []) or 1 for document in load_result.documents)
     fingerprint = corpus_fingerprint(load_result.documents, args.module)
     existing = read_manifest(args.index_dir)
-    if (
+    unchanged = (
         not args.force
         and existing
         and existing.get("corpus_fingerprint") == fingerprint
         and (Path(args.index_dir) / "embeddings.npy").exists()
-    ):
+        and not existing.get("load_errors")
+        and not existing.get("chunk_errors")
+        and not existing.get("embedding_errors")
+    )
+    if unchanged and args.module == 3:
+        ready = validate_unchanged_hybrid_index(args.index_dir)
+        if ready is not None:
+            unchanged_manifest, bm25_chunk_count = ready
+            print(
+                json.dumps(
+                    {
+                        "status": "unchanged",
+                        "source_dir": load_result.source_dir,
+                        "documents": unchanged_manifest.get("document_count"),
+                        "pages": unchanged_manifest.get("page_count", page_count),
+                        "chunks": unchanged_manifest.get("chunk_count"),
+                        "qdrant_collection": settings.QDRANT_COLLECTION,
+                        "qdrant_chunks": unchanged_manifest.get("chunk_count"),
+                        "bm25_chunks": bm25_chunk_count,
+                        "index_dir": str(Path(args.index_dir).resolve()),
+                        "skipped_duplicates": len(load_result.skipped_duplicates),
+                        "load_errors": load_result.errors,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        print("Hybrid index snapshot is unchanged but Qdrant is missing or out of sync; rebuilding")
+    elif unchanged:
         print(
             json.dumps(
                 {
@@ -180,43 +281,93 @@ def main() -> int:
         f"produced {len(chunks)} chunks ({table_chunk_count} table, "
         f"{len(parent_chunks)} parent stored separately, {child_chunk_count} child)"
     )
-    embedder = Embedder(settings.EMBEDDING_MODEL)
-    indexed_chunks, embeddings, embedding_errors = embed_chunks(embedder, chunks)
-    if not indexed_chunks:
-        raise RuntimeError("No embeddings were produced; refusing to replace the existing index")
+    staging_dir = Path(args.index_dir) / ".module3-staging"
+    staged = read_manifest(staging_dir) if args.module == 3 and not args.force else None
+    if (
+        staged
+        and staged.get("corpus_fingerprint") == fingerprint
+        and (staging_dir / "embeddings.npy").exists()
+    ):
+        indexed_chunks, embeddings, staged = load_dense_index(staging_dir)
+        embedding_errors = list(staged.get("embedding_errors") or [])
+        embedder: Embedder | None = None
+        print(f"Reusing {len(indexed_chunks)} staged embeddings after an interrupted module 3 run")
+    else:
+        embedder = Embedder(settings.EMBEDDING_MODEL)
+        indexed_chunks, embeddings, embedding_errors = embed_chunks(embedder, chunks)
+        if not indexed_chunks:
+            raise RuntimeError("No embeddings were produced; refusing to replace the existing index")
 
     indexed_doc_ids = {chunk.metadata.get("doc_id") for chunk in indexed_chunks}
+    manifest_metadata = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_dir": load_result.source_dir,
+        "module": args.module,
+        "embedding_model": settings.EMBEDDING_MODEL,
+        "chunk_size": settings.CHUNK_SIZE,
+        "chunk_overlap": settings.CHUNK_OVERLAP,
+        "embedding_input": "title_section_content_v1",
+        "retrieval_backend": (
+            "hybrid_qdrant_bm25_rrf" if args.module == 3 else "naive_dense_numpy"
+        ),
+        "qdrant_collection": settings.QDRANT_COLLECTION if args.module == 3 else None,
+        "corpus_fingerprint": fingerprint,
+        "document_count": len(indexed_doc_ids),
+        "page_count": page_count,
+        "table_chunk_count": sum(
+            chunk.metadata.get("chunk_type") == "table" for chunk in indexed_chunks
+        ),
+        "parent_chunk_count": len(parent_chunks),
+        "child_chunk_count": sum(
+            chunk.metadata.get("chunk_type") == "child" for chunk in indexed_chunks
+        ),
+        "parent_chunks": [
+            {"chunk_id": chunk.chunk_id, "content": chunk.content, "metadata": chunk.metadata}
+            for chunk in parent_chunks
+        ],
+        "load_errors": load_result.errors,
+        "chunk_errors": chunk_errors,
+        "embedding_errors": embedding_errors,
+        "skipped_duplicates": load_result.skipped_duplicates,
+    }
+
+    if args.module == 3 and embedder is not None:
+        save_dense_index(staging_dir, indexed_chunks, embeddings, manifest_metadata)
+        print(f"Checkpointed {len(indexed_chunks)} embeddings before Qdrant indexing")
+
+    sparse_search: BM25Search | None = None
+    qdrant_count: int | None = None
+    if args.module == 3:
+        stale_chunk_ids: set[str] = set()
+        if existing and not (load_result.errors or chunk_errors or embedding_errors):
+            previous_ids = {
+                item.get("chunk_id")
+                for item in existing.get("chunks", [])
+                if isinstance(item, dict) and isinstance(item.get("chunk_id"), str)
+            }
+            stale_chunk_ids = previous_ids - {chunk.chunk_id for chunk in indexed_chunks}
+        sparse_search, qdrant_count = build_hybrid_indexes(
+            indexed_chunks,
+            embeddings,
+            embedder,
+            stale_chunk_ids=stale_chunk_ids,
+        )
+        if qdrant_count != len(indexed_chunks):
+            raise RuntimeError(
+                f"Qdrant contains {qdrant_count} points after indexing "
+                f"{len(indexed_chunks)} chunks; refusing to persist an out-of-sync BM25 snapshot"
+            )
+        print(
+            f"Hybrid indexes ready: {len(indexed_chunks)} chunks upserted into "
+            f"Qdrant collection '{settings.QDRANT_COLLECTION}', "
+            f"{len(sparse_search.chunks)} chunks loaded into BM25"
+        )
+
     manifest = save_dense_index(
         args.index_dir,
         indexed_chunks,
         embeddings,
-        {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "source_dir": load_result.source_dir,
-            "module": args.module,
-            "embedding_model": settings.EMBEDDING_MODEL,
-            "chunk_size": settings.CHUNK_SIZE,
-            "chunk_overlap": settings.CHUNK_OVERLAP,
-            "embedding_input": "title_section_content_v1",
-            "corpus_fingerprint": fingerprint,
-            "document_count": len(indexed_doc_ids),
-            "page_count": page_count,
-            "table_chunk_count": sum(
-                chunk.metadata.get("chunk_type") == "table" for chunk in indexed_chunks
-            ),
-            "parent_chunk_count": len(parent_chunks),
-            "child_chunk_count": sum(
-                chunk.metadata.get("chunk_type") == "child" for chunk in indexed_chunks
-            ),
-            "parent_chunks": [
-                {"chunk_id": chunk.chunk_id, "content": chunk.content, "metadata": chunk.metadata}
-                for chunk in parent_chunks
-            ],
-            "load_errors": load_result.errors,
-            "chunk_errors": chunk_errors,
-            "embedding_errors": embedding_errors,
-            "skipped_duplicates": load_result.skipped_duplicates,
-        },
+        manifest_metadata,
     )
     print(
         json.dumps(
@@ -231,6 +382,9 @@ def main() -> int:
                 "child_chunks": manifest["child_chunk_count"],
                 "embedding_dimension": manifest["embedding_dimension"],
                 "index_dir": str(Path(args.index_dir).resolve()),
+                "qdrant_collection": settings.QDRANT_COLLECTION if args.module == 3 else None,
+                "qdrant_chunks": qdrant_count,
+                "bm25_chunks": len(sparse_search.chunks) if sparse_search is not None else None,
                 "errors": len(load_result.errors) + len(chunk_errors) + len(embedding_errors),
                 "skipped_duplicates": len(load_result.skipped_duplicates),
             },
