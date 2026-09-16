@@ -1,8 +1,30 @@
 'use client';
 import { useState, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import {
+  friendlyChatError,
+  marksServiceUnavailable,
+  parseChatResponse
+} from '@/lib/chatErrors.mjs';
 import styles from './FloatingChatbot.module.css';
 
 const API_URL = '/api/chat';
+
+const markdownComponents = {
+  a({ node, ...props }) {
+    void node;
+    return <a {...props} target="_blank" rel="noopener noreferrer" />;
+  },
+  table({ node, ...props }) {
+    void node;
+    return (
+      <div className={styles.tableWrapper} role="region" aria-label="Bảng thông tin" tabIndex={0}>
+        <table {...props} />
+      </div>
+    );
+  }
+};
 
 export default function FloatingChatbot() {
   const [isOpen, setIsOpen] = useState(false);
@@ -17,14 +39,15 @@ export default function FloatingChatbot() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [showSuggestions, setShowSuggestions] = useState(true);
-  const [sessionId, setSessionId] = useState(null);
+  const [serviceStatus, setServiceStatus] = useState('unknown');
+  const sessionIdRef = useRef(null);
   const chatAreaRef = useRef(null);
 
   useEffect(() => {
     // Load session ID from localStorage on mount
     const savedSessionId = localStorage.getItem('admitai_session_id');
     if (savedSessionId) {
-      setSessionId(savedSessionId);
+      sessionIdRef.current = savedSessionId;
     }
   }, []);
 
@@ -35,10 +58,35 @@ export default function FloatingChatbot() {
     }
   }, [messages, isLoading]);
 
-  const toggleChat = () => setIsOpen(!isOpen);
+  const checkService = async () => {
+    setServiceStatus('checking');
+    try {
+      const response = await fetch('/api/health', { cache: 'no-store' });
+      const data = await response.json();
+      const ragReady = data?.components?.rag?.ready ?? data?.rag?.ready;
+      setServiceStatus(response.ok && ragReady ? 'available' : 'unavailable');
+    } catch (error) {
+      console.error('Health check error:', error);
+      setServiceStatus('unavailable');
+    }
+  };
+
+  const toggleChat = () => {
+    const willOpen = !isOpen;
+    setIsOpen(willOpen);
+    if (willOpen) {
+      void checkService();
+    }
+  };
 
   const sendMessage = async (text) => {
-    if (!text || !text.trim() || isLoading) return;
+    if (
+      !text
+      || !text.trim()
+      || isLoading
+      || serviceStatus === 'checking'
+      || serviceStatus === 'unavailable'
+    ) return;
     
     setShowSuggestions(false);
     
@@ -50,8 +98,8 @@ export default function FloatingChatbot() {
 
     try {
       const payload = { message: text.trim() };
-      if (sessionId) {
-        payload.session_id = sessionId;
+      if (sessionIdRef.current) {
+        payload.session_id = sessionIdRef.current;
       }
       
       const response = await fetch(API_URL, {
@@ -62,14 +110,11 @@ export default function FloatingChatbot() {
         body: JSON.stringify(payload)
       });
       
-      if (!response.ok) {
-        throw new Error(`API Error: ${response.status}`);
-      }
+      const data = await parseChatResponse(response);
+      setServiceStatus('available');
       
-      const data = await response.json();
-      
-      if (data.session_id && data.session_id !== sessionId) {
-        setSessionId(data.session_id);
+      if (data.session_id && data.session_id !== sessionIdRef.current) {
+        sessionIdRef.current = data.session_id;
         localStorage.setItem('admitai_session_id', data.session_id);
       }
       
@@ -83,10 +128,14 @@ export default function FloatingChatbot() {
       setMessages((prev) => [...prev, newBotMsg]);
     } catch (error) {
       console.error('Chat error:', error);
+      const isOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
+      if (!isOnline || marksServiceUnavailable(error)) {
+        setServiceStatus('unavailable');
+      }
       const errorMsg = {
         id: Date.now() + 1,
         role: 'bot',
-        content: 'Xin lỗi, kết nối đến máy chủ bị lỗi. Vui lòng thử lại sau.',
+        content: friendlyChatError(error, isOnline),
         isError: true,
         citations: []
       };
@@ -144,7 +193,19 @@ export default function FloatingChatbot() {
                 </div>
               )}
               <div className={styles.messageContent}>
-                <div className={styles.text}>{msg.content}</div>
+                {msg.role === 'bot' ? (
+                  <div className={styles.markdown}>
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={markdownComponents}
+                      skipHtml
+                    >
+                      {msg.content}
+                    </ReactMarkdown>
+                  </div>
+                ) : (
+                  <div className={styles.plainText}>{msg.content}</div>
+                )}
                 
                 {msg.citations && msg.citations.length > 0 && (
                   <div className={`${styles.citationsContainer} ${openCitations[msg.id] ? styles.openCitation : ''}`}>
@@ -191,14 +252,29 @@ export default function FloatingChatbot() {
           
           {showSuggestions && (
             <div className={styles.suggestedQuestions}>
-              <button className={styles.suggestionBtn} onClick={() => sendMessage('PTIT có những phương thức tuyển sinh nào trong năm 2026?')}>Phương thức tuyển sinh 2026?</button>
-              <button className={styles.suggestionBtn} onClick={() => sendMessage('Học phí PTIT năm 2026 là bao nhiêu?')}>Học phí năm 2026?</button>
-              <button className={styles.suggestionBtn} onClick={() => sendMessage('Điểm chuẩn ngành Công nghệ thông tin năm 2025 là bao nhiêu?')}>Điểm chuẩn CNTT 2025?</button>
+              <button disabled={serviceStatus !== 'available'} className={styles.suggestionBtn} onClick={() => sendMessage('PTIT có những phương thức tuyển sinh nào trong năm 2026?')}>Phương thức tuyển sinh 2026?</button>
+              <button disabled={serviceStatus !== 'available'} className={styles.suggestionBtn} onClick={() => sendMessage('Học phí PTIT năm 2026 là bao nhiêu?')}>Học phí năm 2026?</button>
+              <button disabled={serviceStatus !== 'available'} className={styles.suggestionBtn} onClick={() => sendMessage('Điểm chuẩn ngành Công nghệ thông tin năm 2025 là bao nhiêu?')}>Điểm chuẩn CNTT 2025?</button>
+            </div>
+          )}
+
+          {(serviceStatus === 'checking' || serviceStatus === 'unavailable') && (
+            <div className={styles.serviceStatus} role="status">
+              <span>
+                {serviceStatus === 'checking'
+                  ? 'Đang kiểm tra dịch vụ tư vấn...'
+                  : 'Dịch vụ tư vấn đang tạm thời chưa sẵn sàng.'}
+              </span>
+              {serviceStatus === 'unavailable' && (
+                <button type="button" onClick={checkService} className={styles.retryBtn}>
+                  Thử lại
+                </button>
+              )}
             </div>
           )}
 
           {isLoading && (
-            <div className={`${styles.message} ${styles.botMessage} ${styles.typingIndicator}`}>
+            <div aria-label="Đang trả lời" className={`${styles.message} ${styles.botMessage} ${styles.typingIndicator}`}>
               <div className={styles.messageAvatar}>
                 <i className="fa-solid fa-robot"></i>
               </div>
@@ -220,9 +296,19 @@ export default function FloatingChatbot() {
               autoComplete="off"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              disabled={isLoading}
+              disabled={isLoading || serviceStatus === 'checking' || serviceStatus === 'unavailable'}
             />
-            <button type="submit" className={styles.sendBtn} disabled={isLoading || !input.trim()}>
+            <button
+              type="submit"
+              className={styles.sendBtn}
+              aria-label="Gửi câu hỏi"
+              disabled={
+                isLoading
+                || !input.trim()
+                || serviceStatus === 'checking'
+                || serviceStatus === 'unavailable'
+              }
+            >
               <i className="fa-solid fa-paper-plane"></i>
             </button>
           </form>

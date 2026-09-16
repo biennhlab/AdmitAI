@@ -3,6 +3,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     NVIDIA_API_KEY: str = "placeholder"
     LLM_MODEL: str = "meta/llama-3.1-70b-instruct"
+    LLM_TIMEOUT_SECONDS: float = 30.0
+    LLM_MAX_RETRIES: int = 1
     JWT_SECRET_KEY: str = "secret"
     JWT_EXPIRY_HOURS: int = 24
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/admitai.db"

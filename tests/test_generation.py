@@ -1,9 +1,9 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from src.generation.llm_client import LLMClient
+from src.generation.llm_client import LLMClient, LLMUpstreamError
 from src.generation.prompts import build_rag_prompt, format_citations, SYSTEM_PROMPT
 from src.generation.session_memory import SessionMemory
-from src.generation.rag_chain import RAGChain, RAGResponse
+from src.generation.rag_chain import FALLBACK_ANSWER, RAGChain
 
 class MockChunk:
     def __init__(self, chunk_id, content, metadata=None):
@@ -42,7 +42,7 @@ def test_llm_client_error():
         mock_client_instance.chat.completions.create.side_effect = Exception("API Error")
 
         client = LLMClient(api_key="fake", model="fake")
-        with pytest.raises(RuntimeError, match="LLM Provider Error: API Error"):
+        with pytest.raises(LLMUpstreamError, match="unexpected error"):
             client.generate("sys", [])
 
 def test_build_rag_prompt_and_format_citations():
@@ -60,6 +60,67 @@ def test_build_rag_prompt_and_format_citations():
     assert messages[0]["role"] == "user"
     assert "What is A?" in messages[0]["content"]
     assert "doc1.pdf" not in messages[0]["content"]
+    assert "retrieved_context" not in messages[0]["content"]
+
+
+def test_system_prompt_enforces_grounding_and_natural_markdown():
+    assert "Chỉ dùng thông tin có trong <retrieved_context>" in SYSTEM_PROMPT
+    assert "không suy đoán" in SYSTEM_PROMPT
+    assert "marker [n] ngay cuối ý hoặc cuối đoạn" in SYSTEM_PROMPT
+    assert "Không tự tạo URL" in SYSTEM_PROMPT
+    assert "Không nhắc hoặc giải thích các cấu trúc nội bộ" in SYSTEM_PROMPT
+    for internal_term in (
+        "retrieved_context",
+        "document",
+        "retrieval",
+        "chunk",
+        "pipeline",
+        "system prompt",
+        "dữ liệu truy xuất",
+        "ngữ cảnh được cung cấp",
+    ):
+        assert internal_term in SYSTEM_PROMPT
+    assert "bảng Markdown" in SYSTEM_PROMPT
+    assert "Dùng bullet" in SYSTEM_PROMPT
+    assert "**bold**" in SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "PTIT có những ngành đào tạo nào?",
+        "Học phí PTIT năm 2026 là bao nhiêu?",
+        "Điểm chuẩn ngành Công nghệ thông tin năm 2025 là bao nhiêu?",
+        "PTIT có những phương thức tuyển sinh nào trong năm 2026?",
+        "So sánh học phí chương trình chuẩn và chất lượng cao.",
+    ],
+)
+def test_generation_contract_preserves_representative_questions(question):
+    message = build_rag_prompt([], question)[0]
+
+    assert message["role"] == "user"
+    assert question in message["content"]
+    assert message["content"].startswith("<user_question>")
+    assert message["content"].endswith("</user_question>")
+    assert "retrieved_context" not in message["content"]
+
+
+def test_fallback_is_natural_and_non_technical():
+    assert FALLBACK_ANSWER == "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có."
+    for internal_term in ("retrieved_context", "retrieval", "chunk", "pipeline", "system prompt"):
+        assert internal_term not in FALLBACK_ANSWER.lower()
+
+
+@pytest.mark.parametrize(
+    ("wrapped", "expected"),
+    [
+        ("<assistant_answer>\n### Ngành đào tạo\n- CNTT [1]\n</assistant_answer>", "### Ngành đào tạo\n- CNTT [1]"),
+        ("<response>Thông tin tuyển sinh [1]</response>", "Thông tin tuyển sinh [1]"),
+        ("Nội dung <document> hợp lệ trong câu trả lời", "Nội dung <document> hợp lệ trong câu trả lời"),
+    ],
+)
+def test_clean_answer_only_removes_known_outer_wrappers(wrapped, expected):
+    assert RAGChain._clean_answer(wrapped) == expected
 
 def test_session_memory_basic():
     mem = SessionMemory()
@@ -122,6 +183,21 @@ def test_rag_chain_answer_order():
     assert "Info?" in call_kwargs["messages"][0]["content"]
     assert "file.pdf" not in call_kwargs["messages"][0]["content"]
 
+
+def test_rag_chain_keeps_context_marker_and_citation_payload_in_the_same_order():
+    chunks = [
+        MockChunk(1, "Ngành thứ nhất", {"doc_id": "same-doc", "source": "file.pdf"}),
+        MockChunk(2, "Ngành thứ hai", {"doc_id": "same-doc", "source": "file.pdf"}),
+    ]
+    mock_llm = MagicMock()
+    mock_llm.generate.return_value = "- Ngành thứ nhất [1]\n- Ngành thứ hai [2]"
+
+    response = RAGChain(MockRetriever(chunks), mock_llm).answer("Ngành thứ nhất và ngành thứ hai")
+
+    assert [citation["chunk_id"] for citation in response.citations] == ["1", "2"]
+    system_prompt = mock_llm.generate.call_args.kwargs["system_prompt"]
+    assert system_prompt.index('id="1"') < system_prompt.index('id="2"')
+
 def test_rag_chain_empty_context():
     retriever = MockRetriever([])
     mock_llm = MagicMock()
@@ -131,8 +207,7 @@ def test_rag_chain_empty_context():
     
     # LLM should not be called
     mock_llm.generate.assert_not_called()
-    assert "chưa tìm thấy" in response.answer
-    assert "tuyển sinh" in response.answer
+    assert response.answer == FALLBACK_ANSWER
     assert len(response.citations) == 0
 
 def test_rag_chain_empty_question():

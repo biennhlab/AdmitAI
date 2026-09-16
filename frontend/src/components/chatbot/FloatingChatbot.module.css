@@ -117,6 +117,7 @@
   display: flex;
   gap: 0.75rem;
   max-width: 85%;
+  min-width: 0;
 }
 
 .userMessage {
@@ -126,6 +127,7 @@
 
 .botMessage {
   align-self: flex-start;
+  max-width: 96%;
 }
 
 .messageAvatar {
@@ -150,6 +152,9 @@
   font-size: 0.95rem;
   line-height: 1.5;
   color: var(--text);
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .userMessage .messageContent {
@@ -163,6 +168,176 @@
   background-color: #fee2e2;
   color: #b91c1c;
   border: 1px solid #fca5a5;
+}
+
+/* Markdown in bot messages */
+.markdown {
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  margin: 1rem 0 0.45rem;
+  color: var(--text);
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.markdown h1 {
+  font-size: 1.25rem;
+}
+
+.markdown h2 {
+  font-size: 1.15rem;
+}
+
+.markdown h3 {
+  font-size: 1.05rem;
+}
+
+.markdown h4 {
+  font-size: 1rem;
+}
+
+.markdown p {
+  margin: 0.65rem 0;
+}
+
+.markdown ul,
+.markdown ol {
+  margin: 0.65rem 0;
+  padding-left: 1.4rem;
+}
+
+.markdown li {
+  margin: 0.3rem 0;
+  padding-left: 0.15rem;
+}
+
+.markdown li > p {
+  margin: 0.25rem 0;
+}
+
+.markdown strong {
+  color: #7f1d1d;
+  font-weight: 700;
+}
+
+.markdown em {
+  color: #475569;
+}
+
+.markdown blockquote {
+  margin: 0.75rem 0;
+  padding: 0.25rem 0 0.25rem 0.75rem;
+  border-left: 3px solid var(--primary);
+  color: #475569;
+  background-color: #f8fafc;
+}
+
+.markdown code {
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.25rem;
+  background-color: #f1f5f9;
+  font-size: 0.88em;
+  overflow-wrap: anywhere;
+}
+
+.markdown pre {
+  max-width: 100%;
+  margin: 0.75rem 0;
+  padding: 0.75rem;
+  overflow-x: auto;
+  border-radius: 0.5rem;
+  background-color: #1e293b;
+  color: #f8fafc;
+}
+
+.markdown pre code {
+  padding: 0;
+  background: none;
+  color: inherit;
+  overflow-wrap: normal;
+}
+
+.markdown a {
+  color: var(--primary);
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.markdown a:hover {
+  color: var(--primary-hover);
+}
+
+.markdown a:focus-visible {
+  border-radius: 0.2rem;
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.markdown .tableWrapper {
+  max-width: 100%;
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+.markdown .tableWrapper:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.markdown table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.markdown th,
+.markdown td {
+  padding: 0.55rem 0.65rem;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown th {
+  background-color: #f1f5f9;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.markdown th:last-child,
+.markdown td:last-child {
+  border-right: none;
+}
+
+.markdown tr:last-child td {
+  border-bottom: none;
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.plainText {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* Citations */
@@ -288,6 +463,48 @@
   color: var(--white);
 }
 
+.suggestionBtn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.suggestionBtn:disabled:hover {
+  background-color: var(--white);
+  color: var(--primary);
+}
+
+.serviceStatus {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid #fecaca;
+  border-radius: 0.6rem;
+  background-color: #fff7ed;
+  color: #9a3412;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.retryBtn {
+  flex-shrink: 0;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: var(--white);
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.retryBtn:hover,
+.retryBtn:focus-visible {
+  background-color: #ffedd5;
+}
+
 /* Typing Indicator */
 .typingDots {
   display: flex;
@@ -372,5 +589,26 @@
   .floatingBtn {
     bottom: 1rem;
     right: 1rem;
+  }
+
+  .chatArea {
+    padding: 1rem;
+  }
+
+  .botMessage {
+    max-width: 100%;
+  }
+
+  .markdown h1 {
+    font-size: 1.15rem;
+  }
+
+  .markdown h2 {
+    font-size: 1.08rem;
+  }
+
+  .markdown ul,
+  .markdown ol {
+    padding-left: 1.2rem;
   }
 }

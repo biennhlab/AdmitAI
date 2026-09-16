@@ -8,10 +8,11 @@ from typing import Any, List, Optional
 from .prompts import SYSTEM_PROMPT, build_rag_prompt, format_citations
 
 
-FALLBACK_ANSWER = (
-    "Mình chưa tìm thấy thông tin đủ phù hợp trong dữ liệu tuyển sinh PTIT hiện có để trả lời "
-    "câu hỏi này. Bạn vui lòng hỏi cụ thể hơn hoặc liên hệ Ban Tư vấn Tuyển sinh PTIT."
-)
+FALLBACK_ANSWER = "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có."
+
+
+class RAGRetrievalError(RuntimeError):
+    """The retrieval dependency failed while answering a request."""
 
 
 @dataclass
@@ -92,15 +93,29 @@ class RAGChain:
     @staticmethod
     def _clean_answer(answer: str) -> str:
         cleaned = answer.strip()
-        cleaned = re.sub(r"^<assistant_answer>\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*</assistant_answer>$", "", cleaned, flags=re.IGNORECASE)
+        wrapper_names = "assistant_answer|answer|response|final"
+        cleaned = re.sub(
+            rf"\A<(?:{wrapper_names})>\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            rf"\s*</(?:{wrapper_names})>\Z",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
         return cleaned.strip()
 
     def answer(self, question: str, session_history: Optional[List[dict]] = None) -> RAGResponse:
         if not question or not question.strip():
             return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
 
-        retrieved = self.retriever.search(question, top_k=self.top_k)
+        try:
+            retrieved = self.retriever.search(question, top_k=self.top_k)
+        except Exception as exc:
+            raise RAGRetrievalError("Retrieval dependency failed") from exc
         if self.min_score is not None:
             retrieved = [(chunk, score) for chunk, score in retrieved if score >= self.min_score]
         if not retrieved or not self._has_lexical_evidence(question, retrieved):
@@ -119,12 +134,7 @@ class RAGChain:
             self.llm_client.generate(system_prompt=system_prompt, messages=messages)
         )
 
-        citations: list[dict[str, Any]] = []
-        seen: set[tuple[str, Any, str]] = set()
-        for chunk, score in retrieved:
-            citation = self._citation(chunk, score)
-            identity = (citation["doc_id"], citation["page"], citation["source_url"])
-            if identity not in seen:
-                seen.add(identity)
-                citations.append(citation)
+        # Keep a one-to-one mapping with the numbered context documents so an
+        # answer marker [n] always points to citations[n - 1] in the API payload.
+        citations = [self._citation(chunk, score) for chunk, score in retrieved]
         return RAGResponse(answer, citations, "general")

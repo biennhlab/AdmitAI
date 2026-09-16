@@ -7,10 +7,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from qdrant_client import QdrantClient
+from sqlalchemy import text
 from slowapi.errors import RateLimitExceeded
 from api.routers import chat, auth, admin
 from src.config import settings
-from src.database.connection import init_db
+from src.database.connection import engine, init_db
 from src.retrieval import (
     BM25Search,
     Embedder,
@@ -26,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AdmitAI API")
 
+_NOT_STARTED = {"ready": False, "error": "Startup check has not completed."}
+app.state.components = {
+    "database": dict(_NOT_STARTED),
+    "local_index": dict(_NOT_STARTED),
+    "qdrant": dict(_NOT_STARTED),
+    "llm": {"configured": False},
+}
+
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -38,8 +47,13 @@ app.add_middleware(
 )
 
 
-def load_hybrid_retriever() -> tuple[QdrantClient, HybridRetriever, dict[str, Any]]:
-    """Load and validate both retrieval branches once for this API process."""
+def _llm_is_configured() -> bool:
+    key = settings.NVIDIA_API_KEY.strip()
+    return bool(key) and key.lower() not in {"placeholder", "your_nvidia_api_key_here"}
+
+
+def load_local_index() -> tuple[list[Any], dict[str, Any]]:
+    """Load and validate the local snapshot without contacting other services."""
     chunks, _embeddings, manifest = load_dense_index(settings.INDEX_DIR)
     if manifest.get("module") != 3:
         raise RuntimeError(
@@ -51,6 +65,16 @@ def load_hybrid_retriever() -> tuple[QdrantClient, HybridRetriever, dict[str, An
             f"Index model '{manifest.get('embedding_model')}' differs from configured "
             f"model '{settings.EMBEDDING_MODEL}'; run module 3 ingestion again"
         )
+    return chunks, manifest
+
+
+def load_hybrid_retriever(
+    chunks: list[Any] | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> tuple[QdrantClient, HybridRetriever, dict[str, Any]]:
+    """Load and validate both retrieval branches once for this API process."""
+    if chunks is None or manifest is None:
+        chunks, manifest = load_local_index()
 
     client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
     try:
@@ -85,9 +109,58 @@ def load_hybrid_retriever() -> tuple[QdrantClient, HybridRetriever, dict[str, An
 
 @app.on_event("startup")
 async def startup_event():
-    await init_db()
+    app.state.components = {
+        "database": {"ready": False, "error": "Database initialization failed."},
+        "local_index": {"ready": False, "error": "Local index is unavailable or invalid."},
+        "qdrant": {"ready": False, "error": "Qdrant is unavailable or out of sync."},
+        "llm": {"configured": _llm_is_configured()},
+    }
+
     try:
-        client, retriever, manifest = await asyncio.to_thread(load_hybrid_retriever)
+        await init_db()
+        app.state.components["database"] = {"ready": True}
+    except Exception:
+        logger.exception("Database startup check failed; API is running in degraded mode")
+
+    try:
+        chunks, manifest = await asyncio.to_thread(load_local_index)
+        app.state.components["local_index"] = {
+            "ready": True,
+            "documents": int(manifest.get("document_count", 0)),
+            "chunks": len(chunks),
+            "embedding_model": manifest.get("embedding_model"),
+        }
+    except Exception as exc:
+        chat.mark_rag_unavailable(exc, "Chỉ mục tuyển sinh đang tạm thời chưa sẵn sàng.")
+        logger.exception("Local index startup check failed; API is running in degraded mode")
+        return
+
+    try:
+        client, retriever, manifest = await asyncio.to_thread(
+            load_hybrid_retriever,
+            chunks,
+            manifest,
+        )
+        app.state.components["qdrant"] = {
+            "ready": True,
+            "collection": settings.QDRANT_COLLECTION,
+            "chunks": len(chunks),
+        }
+    except Exception as exc:
+        chat.mark_rag_unavailable(exc, "Kho dữ liệu tuyển sinh đang tạm thời chưa sẵn sàng.")
+        logger.exception("Qdrant startup check failed; API is running in degraded mode")
+        return
+
+    if not app.state.components["llm"]["configured"]:
+        client.close()
+        chat.mark_rag_unavailable(
+            RuntimeError("NVIDIA_API_KEY is not configured"),
+            "Dịch vụ xử lý câu hỏi đang tạm thời chưa sẵn sàng.",
+        )
+        logger.error("NVIDIA_API_KEY is not configured; API is running in degraded mode")
+        return
+
+    try:
         try:
             await asyncio.to_thread(
                 chat.initialize_rag,
@@ -126,10 +199,96 @@ app.include_router(admin.router)
 
 @app.get("/api/health")
 async def health_check():
+    components = {name: dict(value) for name, value in app.state.components.items()}
+
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+        components["database"] = {"ready": True}
+    except Exception:
+        components["database"] = {
+            "ready": False,
+            "error": "Database is unavailable.",
+        }
+
+    if components["local_index"]["ready"]:
+        index_dir = Path(settings.INDEX_DIR)
+        if not (index_dir / "manifest.json").is_file() or not (index_dir / "embeddings.npy").is_file():
+            components["local_index"] = {
+                "ready": False,
+                "error": "Local index files are unavailable.",
+            }
+
+    qdrant_client = getattr(app.state, "qdrant_client", None)
+    
+    # Auto-reconnect Qdrant and RAG if they failed during startup
+    if (not components["qdrant"]["ready"] or qdrant_client is None) and components["local_index"]["ready"]:
+        try:
+            chunks, manifest = await asyncio.to_thread(load_local_index)
+            client, retriever, _ = await asyncio.to_thread(
+                load_hybrid_retriever, chunks, manifest
+            )
+            app.state.qdrant_client = client
+            app.state.hybrid_retriever = retriever
+            qdrant_client = client
+            await asyncio.to_thread(
+                chat.initialize_rag, retriever=retriever, manifest=manifest
+            )
+            app.state.components["qdrant"] = {
+                "ready": True,
+                "collection": settings.QDRANT_COLLECTION,
+                "chunks": len(chunks),
+            }
+            components["qdrant"] = dict(app.state.components["qdrant"])
+            components["llm"]["configured"] = _llm_is_configured()
+            app.state.components["llm"]["configured"] = components["llm"]["configured"]
+        except Exception:
+            pass
+    if components["qdrant"]["ready"] and qdrant_client is not None:
+        try:
+            collection_exists = await asyncio.to_thread(
+                qdrant_client.collection_exists,
+                settings.QDRANT_COLLECTION,
+            )
+            count = await asyncio.to_thread(
+                qdrant_client.count,
+                collection_name=settings.QDRANT_COLLECTION,
+                exact=True,
+            )
+            expected_chunks = int(components["local_index"].get("chunks", 0))
+            actual_chunks = int(count.count)
+            if not collection_exists or (expected_chunks and actual_chunks != expected_chunks):
+                raise RuntimeError("Qdrant collection is missing or out of sync")
+            components["qdrant"] = {
+                "ready": True,
+                "collection": settings.QDRANT_COLLECTION,
+                "chunks": actual_chunks,
+            }
+        except Exception:
+            components["qdrant"] = {
+                "ready": False,
+                "error": "Qdrant is unavailable or out of sync.",
+            }
+
     rag = chat.rag_status()
-    return {"status": "healthy" if rag["ready"] else "degraded", "rag": rag}
+    if not components["local_index"]["ready"] or not components["qdrant"]["ready"]:
+        rag = {
+            **rag,
+            "ready": False,
+            "error": "Dịch vụ dữ liệu tuyển sinh đang tạm thời chưa sẵn sàng.",
+        }
+    components["rag"] = rag
+    all_ready = (
+        components["database"]["ready"]
+        and components["local_index"]["ready"]
+        and components["qdrant"]["ready"]
+        and components["llm"]["configured"]
+        and components["rag"]["ready"]
+    )
+    return {"status": "healthy" if all_ready else "degraded", "components": components}
 
 
 frontend_dir = Path(__file__).resolve().parents[1] / "frontend" / "chatbot"
 if frontend_dir.exists():
     app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="chatbot")
+# Trigger reload

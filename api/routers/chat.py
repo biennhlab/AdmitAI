@@ -12,8 +12,15 @@ from api.schemas import ChatRequest, ChatResponse, Citation, FeedbackRequest
 from src.config import settings
 from src.database.connection import get_db
 from src.database.models import ChatMessage, ChatSession
-from src.generation.llm_client import LLMClient
-from src.generation.rag_chain import RAGChain
+from src.generation.llm_client import (
+    LLMAuthenticationError,
+    LLMClient,
+    LLMConnectionError,
+    LLMProviderError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+)
+from src.generation.rag_chain import RAGChain, RAGRetrievalError
 from src.generation.session_memory import SessionMemory
 from src.retrieval import Embedder, NaiveDenseSearch, load_dense_index
 
@@ -24,6 +31,19 @@ session_memory = SessionMemory()
 rag_chain: RAGChain | None = None
 rag_manifest: dict[str, Any] | None = None
 rag_initialization_error: str | None = None
+rag_public_error: str | None = None
+
+RAG_UNAVAILABLE_MESSAGE = "Dịch vụ tư vấn đang tạm thời chưa sẵn sàng."
+LLM_TIMEOUT_MESSAGE = "Yêu cầu xử lý mất nhiều thời gian hơn dự kiến."
+LLM_UNAVAILABLE_MESSAGE = "Dịch vụ xử lý câu hỏi đang tạm thời chưa sẵn sàng."
+INTERNAL_ERROR_MESSAGE = "Không thể xử lý yêu cầu lúc này."
+
+
+def _service_error(status_code: int, code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
 
 
 def initialize_rag(
@@ -33,7 +53,7 @@ def initialize_rag(
     manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create the process-wide RAG chain from a loaded or injected retriever."""
-    global rag_chain, rag_manifest, rag_initialization_error
+    global rag_chain, rag_manifest, rag_initialization_error, rag_public_error
     try:
         is_injected = retriever is not None
         if is_injected:
@@ -57,7 +77,12 @@ def initialize_rag(
                 f"Index model '{indexed_model}' differs from configured model '{settings.EMBEDDING_MODEL}'. "
                 "Run scripts/ingest.py again."
             )
-        llm_client = LLMClient(api_key=settings.NVIDIA_API_KEY, model=settings.LLM_MODEL)
+        llm_client = LLMClient(
+            api_key=settings.NVIDIA_API_KEY,
+            model=settings.LLM_MODEL,
+            timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
+            max_retries=settings.LLM_MAX_RETRIES,
+        )
         rag_chain = RAGChain(
             retriever,
             llm_client,
@@ -68,6 +93,7 @@ def initialize_rag(
         )
         rag_manifest = loaded_manifest
         rag_initialization_error = None
+        rag_public_error = None
         logger.info(
             "RAG ready: %s documents, %s chunks, backend=%s",
             loaded_manifest["document_count"],
@@ -79,22 +105,27 @@ def initialize_rag(
         rag_chain = None
         rag_manifest = None
         rag_initialization_error = str(exc)
+        rag_public_error = RAG_UNAVAILABLE_MESSAGE
         logger.exception("RAG initialization failed")
         raise
 
 
-def mark_rag_unavailable(exc: Exception) -> None:
+def mark_rag_unavailable(
+    exc: Exception,
+    public_error: str = RAG_UNAVAILABLE_MESSAGE,
+) -> None:
     """Expose startup failures through health and chat responses."""
-    global rag_chain, rag_manifest, rag_initialization_error
+    global rag_chain, rag_manifest, rag_initialization_error, rag_public_error
     rag_chain = None
     rag_manifest = None
     rag_initialization_error = str(exc)
+    rag_public_error = public_error
 
 
 def rag_status() -> dict[str, Any]:
     return {
         "ready": rag_chain is not None,
-        "error": rag_initialization_error,
+        "error": rag_public_error,
         "backend": (
             rag_manifest.get("retrieval_backend", rag_manifest.get("backend"))
             if rag_manifest
@@ -111,21 +142,16 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)) -> Chat
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
     if rag_chain is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"RAG index is not ready: {rag_initialization_error or 'run scripts/ingest.py'}",
+        raise _service_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "RAG_UNAVAILABLE",
+            rag_public_error or RAG_UNAVAILABLE_MESSAGE,
         )
 
     session_id = request.session_id
-    if not session_id or session_id not in session_memory.sessions:
+    is_new_session = not session_id or session_id not in session_memory.sessions
+    if is_new_session:
         session_id = session_memory.create_session()
-        db.add(ChatSession(id=session_id))
-        try:
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            logger.exception("Could not create chat session")
-            raise HTTPException(status_code=500, detail="Could not create chat session")
 
     history_for_rag = session_memory.get_history(session_id, max_turns=5)
     try:
@@ -134,31 +160,79 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)) -> Chat
             request.message,
             history_for_rag,
         )
+    except LLMTimeoutError as exc:
+        logger.exception("Chat generation timed out")
+        raise _service_error(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            exc.code,
+            LLM_TIMEOUT_MESSAGE,
+        ) from exc
+    except LLMAuthenticationError as exc:
+        logger.exception("Chat generation failed because provider authentication was rejected")
+        raise _service_error(
+            status.HTTP_502_BAD_GATEWAY,
+            exc.code,
+            LLM_UNAVAILABLE_MESSAGE,
+        ) from exc
+    except LLMRateLimitError as exc:
+        logger.exception("Chat generation was rate limited by the provider")
+        raise _service_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            exc.code,
+            LLM_UNAVAILABLE_MESSAGE,
+        ) from exc
+    except LLMConnectionError as exc:
+        logger.exception("Chat generation could not reach the provider")
+        raise _service_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            exc.code,
+            LLM_UNAVAILABLE_MESSAGE,
+        ) from exc
+    except LLMProviderError as exc:
+        logger.exception("Chat generation failed at the provider")
+        raise _service_error(
+            status.HTTP_502_BAD_GATEWAY,
+            exc.code,
+            LLM_UNAVAILABLE_MESSAGE,
+        ) from exc
+    except RAGRetrievalError as exc:
+        logger.exception("Chat generation dependency failed")
+        raise _service_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "RAG_UNAVAILABLE",
+            RAG_UNAVAILABLE_MESSAGE,
+        ) from exc
     except Exception as exc:
-        logger.exception("RAG generation failed")
-        raise HTTPException(status_code=503, detail=f"RAG generation failed: {exc}")
+        logger.exception("Unexpected chat generation failure")
+        raise _service_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            INTERNAL_ERROR_MESSAGE,
+        ) from exc
 
     session_memory.add_message(session_id, "user", request.message)
     session_memory.add_message(session_id, "assistant", response.answer)
     citations_payload = response.citations
-    db.add_all(
-        [
-            ChatMessage(session_id=session_id, role="user", content=request.message),
-            ChatMessage(
-                session_id=session_id,
-                role="assistant",
-                content=response.answer,
-                citations=citations_payload,
-                route_type=response.route_type,
-            ),
-        ]
-    )
+    records = [
+        ChatMessage(session_id=session_id, role="user", content=request.message),
+        ChatMessage(
+            session_id=session_id,
+            role="assistant",
+            content=response.answer,
+            citations=citations_payload,
+            route_type=response.route_type,
+        ),
+    ]
+    if is_new_session:
+        records.insert(0, ChatSession(id=session_id))
+    db.add_all(records)
     try:
         await db.commit()
     except Exception:
         await db.rollback()
         logger.exception("Could not persist chat messages")
-        raise HTTPException(status_code=500, detail="Could not persist chat messages")
+        # Persistence is best-effort; a generated, grounded answer remains
+        # useful even when conversation storage is temporarily unavailable.
 
     return ChatResponse(
         answer=response.answer,
