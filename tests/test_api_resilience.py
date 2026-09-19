@@ -247,13 +247,13 @@ async def test_chat_classifies_provider_errors_and_process_stays_healthy(
 
 @pytest.mark.asyncio
 async def test_unexpected_chat_error_returns_safe_500():
-    chat.rag_chain = FakeRAG(error=ValueError("NVIDIA_API_KEY=secret"))
+    chat.rag_chain = FakeRAG(error=ValueError("LLM_API_KEY=secret"))
 
     response = await request("POST", "/api/chat", json={"message": "Chỉ tiêu?"})
 
     assert response.status_code == 500
     assert response.json()["detail"]["code"] == "INTERNAL_ERROR"
-    assert "NVIDIA_API_KEY" not in response.text
+    assert "LLM_API_KEY" not in response.text
     assert "secret" not in response.text
 
 
@@ -298,13 +298,13 @@ def test_llm_client_classifies_openai_compatible_errors(sdk_error_type, domain_e
         provider = MagicMock()
         provider.chat.completions.create.side_effect = sdk_error(sdk_error_type)
         openai_class.return_value = provider
-        client = LLMClient("not-a-real-key", "model", timeout_seconds=2, max_retries=0)
+        client = LLMClient("not-a-real-key", "model", base_url="fake-url", timeout_seconds=2, max_retries=0)
 
         with pytest.raises(domain_error_type):
             client.generate("system", [{"role": "user", "content": "hello"}])
 
         openai_class.assert_called_once_with(
-            base_url="https://integrate.api.nvidia.com/v1",
+            base_url="fake-url",
             api_key="not-a-real-key",
             timeout=2,
             max_retries=0,

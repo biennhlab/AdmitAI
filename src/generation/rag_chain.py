@@ -108,6 +108,78 @@ class RAGChain:
         )
         return cleaned.strip()
 
+    def answer_stream(self, question: str, session_history: Optional[List[dict]] = None) -> Any:
+        if not question or not question.strip():
+            yield {"type": "metadata", "citations": [], "route_type": "out_of_scope"}
+            yield {"type": "chunk", "text": FALLBACK_ANSWER}
+            return
+
+        try:
+            retrieved = self.retriever.search(question, top_k=self.top_k)
+        except Exception as exc:
+            raise RAGRetrievalError("Retrieval dependency failed") from exc
+            
+        if self.min_score is not None:
+            retrieved = [(chunk, score) for chunk, score in retrieved if score >= self.min_score]
+            
+        from .assembler import ContextAssembler
+        assembler = ContextAssembler(max_chars=12000)
+        final_retrieved = assembler.assemble(retrieved)
+
+        if not final_retrieved or not self._has_lexical_evidence(question, final_retrieved):
+            yield {"type": "metadata", "citations": [], "route_type": "out_of_scope"}
+            yield {"type": "chunk", "text": FALLBACK_ANSWER}
+            return
+
+        chunks = [chunk for chunk, _ in final_retrieved]
+        scores = [float(score) for _, score in final_retrieved]
+        context = format_citations(chunks, scores)
+        system_prompt = SYSTEM_PROMPT.format(context=context)
+
+        messages: list[dict[str, str]] = []
+        if session_history:
+            messages.extend(session_history)
+        messages.extend(build_rag_prompt(chunks, question))
+        
+        citations = [self._citation(chunk, score) for chunk, score in final_retrieved]
+        yield {"type": "metadata", "citations": citations, "route_type": "general"}
+        
+        generator = self.llm_client.generate_stream(system_prompt=system_prompt, messages=messages)
+        
+        accumulator = ""
+        started_streaming = False
+        wrapper_pattern = re.compile(r"^(?:<assistant_answer>|<answer>|<response>|<final>)\s*", re.IGNORECASE)
+        close_pattern = re.compile(r"</(?:assistant_answer|answer|response|final)>.*", re.IGNORECASE | re.DOTALL)
+        
+        for chunk_text in generator:
+            accumulator += chunk_text
+            if not started_streaming:
+                if accumulator.startswith("<"):
+                    if len(accumulator) > 20 and not wrapper_pattern.match(accumulator):
+                        started_streaming = True
+                    elif wrapper_pattern.match(accumulator):
+                        accumulator = wrapper_pattern.sub("", accumulator)
+                        started_streaming = True
+                else:
+                    started_streaming = True
+            
+            if started_streaming:
+                if len(accumulator) > 30:
+                    emit = accumulator[:-30]
+                    accumulator = accumulator[-30:]
+                    if close_pattern.search(emit):
+                        emit = close_pattern.sub("", emit)
+                        if emit:
+                            yield {"type": "chunk", "text": emit}
+                        break
+                    else:
+                        yield {"type": "chunk", "text": emit}
+                        
+        if started_streaming and accumulator:
+            accumulator = close_pattern.sub("", accumulator)
+            if accumulator:
+                yield {"type": "chunk", "text": accumulator}
+
     def answer(self, question: str, session_history: Optional[List[dict]] = None) -> RAGResponse:
         if not question or not question.strip():
             return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
@@ -118,11 +190,16 @@ class RAGChain:
             raise RAGRetrievalError("Retrieval dependency failed") from exc
         if self.min_score is not None:
             retrieved = [(chunk, score) for chunk, score in retrieved if score >= self.min_score]
-        if not retrieved or not self._has_lexical_evidence(question, retrieved):
+            
+        from .assembler import ContextAssembler
+        assembler = ContextAssembler(max_chars=12000)
+        final_retrieved = assembler.assemble(retrieved)
+
+        if not final_retrieved or not self._has_lexical_evidence(question, final_retrieved):
             return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
 
-        chunks = [chunk for chunk, _ in retrieved]
-        scores = [float(score) for _, score in retrieved]
+        chunks = [chunk for chunk, _ in final_retrieved]
+        scores = [float(score) for _, score in final_retrieved]
         context = format_citations(chunks, scores)
         system_prompt = SYSTEM_PROMPT.format(context=context)
 
@@ -136,5 +213,5 @@ class RAGChain:
 
         # Keep a one-to-one mapping with the numbered context documents so an
         # answer marker [n] always points to citations[n - 1] in the API payload.
-        citations = [self._citation(chunk, score) for chunk, score in retrieved]
+        citations = [self._citation(chunk, score) for chunk, score in final_retrieved]
         return RAGResponse(answer, citations, "general")

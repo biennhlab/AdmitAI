@@ -2,7 +2,7 @@
 
 ## Local development
 
-1. Copy `.env.example` to `.env`, then configure `NVIDIA_API_KEY` and the other backend settings.
+1. Copy `.env.example` to `.env`, then configure `LLM_API_KEY` and the other backend settings.
 2. Start Qdrant:
 
    ```bash

@@ -8,9 +8,7 @@ from rank_bm25 import BM25Okapi
 from src.ingestion.chunker import Chunk
 
 
-def tokenize(text: str) -> list[str]:
-    """Tokenize consistently using the phase-3 whitespace strategy."""
-    return text.casefold().split()
+from src.retrieval.document import chunk_search_text, tokenize
 
 
 class BM25Search:
@@ -100,6 +98,6 @@ class BM25Search:
         """Rebuild BM25 after callers add, remove, or replace ``self.chunks``."""
         validated = self._validated_chunks(self.chunks)
         self.chunks = self._deduplicate(validated)
-        self.tokenized_corpus = [tokenize(chunk.content) for chunk in self.chunks]
+        self.tokenized_corpus = [tokenize(chunk_search_text(chunk)) for chunk in self.chunks]
         self._token_sets = [set(tokens) for tokens in self.tokenized_corpus]
         self.bm25 = BM25Okapi(self.tokenized_corpus) if self.chunks else None

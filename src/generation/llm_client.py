@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Iterator
 
 from openai import (
     APIConnectionError,
@@ -40,19 +40,19 @@ class LLMUpstreamError(LLMProviderError):
 
 
 class LLMClient:
-    """Wrapper for NVIDIA NIM (OpenAI-compatible) API"""
+    """Wrapper for Gemini (OpenAI-compatible) API"""
 
     def __init__(
         self,
         api_key: str,
         model: str,
+        base_url: str,
         timeout_seconds: float = 30.0,
         max_retries: int = 1,
     ):
         self.model = model
-        # Using NVIDIA's OpenAI compatible endpoint
         self.client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
+            base_url=base_url,
             api_key=api_key,
             timeout=timeout_seconds,
             max_retries=max_retries,
@@ -71,6 +71,42 @@ class LLMClient:
                 max_tokens=1024,
             )
             return response.choices[0].message.content
+        except AuthenticationError as exc:
+            logger.exception("LLM provider authentication failed")
+            raise LLMAuthenticationError("LLM provider authentication failed") from exc
+        except APITimeoutError as exc:
+            logger.exception("LLM provider request timed out")
+            raise LLMTimeoutError("LLM provider request timed out") from exc
+        except RateLimitError as exc:
+            logger.exception("LLM provider rate limit reached")
+            raise LLMRateLimitError("LLM provider rate limit reached") from exc
+        except APIConnectionError as exc:
+            logger.exception("Could not connect to the LLM provider")
+            raise LLMConnectionError("Could not connect to the LLM provider") from exc
+        except APIStatusError as exc:
+            logger.exception("LLM provider returned HTTP %s", exc.status_code)
+            raise LLMUpstreamError("LLM provider returned an error") from exc
+        except Exception as exc:
+            logger.exception("Unexpected LLM provider failure")
+            raise LLMUpstreamError("LLM provider returned an unexpected error") from exc
+
+    def generate_stream(self, system_prompt: str, messages: List[Dict[str, str]], temperature: float = 0.3) -> Iterator[str]:
+        """Generate a streamed response using the provided system prompt and message history."""
+        try:
+            formatted_messages = [{"role": "system", "content": system_prompt}]
+            formatted_messages.extend(messages)
+
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=formatted_messages,
+                temperature=temperature,
+                max_tokens=1024,
+                stream=True,
+            )
+            for chunk in response:
+                content = chunk.choices[0].delta.content
+                if content is not None:
+                    yield content
         except AuthenticationError as exc:
             logger.exception("LLM provider authentication failed")
             raise LLMAuthenticationError("LLM provider authentication failed") from exc

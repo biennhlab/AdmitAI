@@ -6,8 +6,8 @@ from src.ingestion.chunker import Chunk
 from src.retrieval.fusion import HybridRetriever, reciprocal_rank_fusion
 
 
-def chunk(chunk_id: str, *, content: str | None = None) -> Chunk:
-    return Chunk(chunk_id=chunk_id, content=content or f"content-{chunk_id}")
+def chunk(chunk_id: str, *, content: str | None = None, metadata: dict[str, Any] | None = None) -> Chunk:
+    return Chunk(chunk_id=chunk_id, content=content or f"content-{chunk_id}", metadata=metadata)
 
 
 def ids(results: list[tuple[Chunk, float]]) -> list[str]:
@@ -114,8 +114,10 @@ def test_hybrid_honors_top_k_calls_both_and_does_not_mutate_inputs() -> None:
 
     results = HybridRetriever(dense, sparse).search("điểm chuẩn", top_k=2)
 
-    assert dense.calls == [("điểm chuẩn", 2)]
-    assert sparse.calls == [("điểm chuẩn", 2)]
+    from src.config import settings
+    expected_k = 2 * settings.RETRIEVAL_CANDIDATE_MULTIPLIER
+    assert dense.calls == [("điểm chuẩn", expected_k)]
+    assert sparse.calls == [("điểm chuẩn", expected_k)]
     assert dense_results == dense_before
     assert sparse_results == sparse_before
     assert ids(results) == ["shared", "dense"]
@@ -172,3 +174,152 @@ def test_hybrid_is_deterministic_across_repeated_calls() -> None:
     ]
 
     assert snapshots == [snapshots[0]] * 5
+
+def test_hybrid_expands_to_parent_and_deduplicates() -> None:
+    parent = {"chunk_id": "p1", "content": "parent content", "metadata": {"chunk_type": "parent"}}
+    c1 = chunk("c1", metadata={"parent_chunk_id": "p1"})
+    c2 = chunk("c2", metadata={"parent_chunk_id": "p1"})
+    c3 = chunk("c3") # No parent
+
+    dense = StubRetriever([(c1, 0.99), (c3, 0.80)])
+    sparse = StubRetriever([(c2, 10.0), (c3, 5.0)])
+    
+    retriever = HybridRetriever(dense, sparse, parent_chunks=[parent])
+    results = retriever.search("query", top_k=5)
+    
+    # RRF ranks:
+    # c1: dense rank 1 (1/61)
+    # c2: sparse rank 1 (1/61)
+    # c3: dense rank 2 (1/62), sparse rank 2 (1/62) -> 2/62
+    # So both c1 and c2 have same score 1/61, c3 has 2/62 = 1/31 (~0.032). 
+    # 1/61 is ~0.016. So c3 has higher RRF score!
+    # Wait, c1 is rank 1 in dense. c2 is rank 1 in sparse.
+    # Actually fused_scores: c1: 1/61. c2: 1/61. c3: 1/62 + 1/62 = 2/62 (~0.0322).
+    # So c3 is first.
+    # Then c1 and c2. Both c1 and c2 point to parent "p1".
+    # When hydrating, c1 -> p1. seen_chunk_ids has p1.
+    # c2 -> p1 (skipped).
+    # Expected results: [c3, p1]
+    
+    assert len(results) == 2
+    assert results[0][0].chunk_id == "c3"
+    assert results[1][0].chunk_id == "p1"
+    assert results[1][0].content == "parent content"
+
+def test_hybrid_coverage_mode_increases_candidate_pool() -> None:
+    dense = StubRetriever([])
+    sparse = StubRetriever([])
+    
+    HybridRetriever(dense, sparse).search("danh sách các ngành", top_k=2)
+    
+    from src.config import settings
+    expected_k = 2 * (settings.RETRIEVAL_CANDIDATE_MULTIPLIER * 2)
+    assert dense.calls == [("danh sách các ngành", expected_k)]
+
+
+def test_hybrid_expands_neighbors_for_coverage_mode() -> None:
+    # 5 contiguous chunks to test budget=2
+    metadata_1 = {"doc_id": "doc1", "chunk_index": 1, "heading_path": ["H1"]}
+    metadata_2 = {"doc_id": "doc1", "chunk_index": 2, "heading_path": ["H1"]}
+    metadata_3 = {"doc_id": "doc1", "chunk_index": 3, "heading_path": ["H1"]}
+    metadata_4 = {"doc_id": "doc1", "chunk_index": 4, "heading_path": ["H1"]}
+    metadata_5 = {"doc_id": "doc1", "chunk_index": 5, "heading_path": ["H2"]} # diff heading
+    
+    c1 = chunk("c1", metadata=metadata_1)
+    c2 = chunk("c2", metadata=metadata_2)
+    c3 = chunk("c3", metadata=metadata_3)
+    c4 = chunk("c4", metadata=metadata_4)
+    c5 = chunk("c5", metadata=metadata_5)
+    
+    dense = StubRetriever([(c3, 0.99)])
+    sparse = StubRetriever([])
+    
+    sparse.chunks = [c1, c2, c3, c4, c5]
+    
+    retriever = HybridRetriever(dense, sparse)
+    
+    # Query without coverage intent -> only c3 (factual query)
+    results = retriever.search("điểm chuẩn", top_k=5)
+    assert len(results) == 1
+    assert results[0][0].chunk_id == "c3"
+    
+    # Query with coverage intent -> expands to c2, c4 (budget=1) and c1 (budget=2). c5 has diff heading so excluded.
+    results_enum = retriever.search("danh sách các ngành", top_k=10)
+    assert len(results_enum) == 4
+    result_ids = [r[0].chunk_id for r in results_enum]
+    # c3 is main. Then neighbors offsets: offset=1 (-1=c2, +1=c4), offset=2 (-2=c1)
+    assert result_ids == ["c3", "c2", "c4", "c1"]
+
+
+def test_hybrid_diversity_aware_selection() -> None:
+    # 5 chunks from doc1/H1
+    d1_c1 = chunk("d1_c1", metadata={"doc_id": "d1", "heading_path": ["H1"]})
+    d1_c2 = chunk("d1_c2", metadata={"doc_id": "d1", "heading_path": ["H1"]})
+    d1_c3 = chunk("d1_c3", metadata={"doc_id": "d1", "heading_path": ["H1"]})
+    d1_c4 = chunk("d1_c4", metadata={"doc_id": "d1", "heading_path": ["H1"]})
+    d1_c5 = chunk("d1_c5", metadata={"doc_id": "d1", "heading_path": ["H1"]})
+    
+    # 2 chunks from doc2/H2 (different section)
+    d2_c1 = chunk("d2_c1", metadata={"doc_id": "d2", "heading_path": ["H2"]})
+    d2_c2 = chunk("d2_c2", metadata={"doc_id": "d2", "heading_path": ["H2"]})
+    
+    # Dense scores: d1 chunks are ranked very high, then d2 chunks
+    dense = StubRetriever([
+        (d1_c1, 0.99),
+        (d1_c2, 0.98),
+        (d1_c3, 0.97),
+        (d1_c4, 0.96),
+        (d1_c5, 0.95),
+        (d2_c1, 0.50),
+        (d2_c2, 0.40)
+    ])
+    sparse = StubRetriever([])
+    
+    retriever = HybridRetriever(dense, sparse)
+    
+    # Search top_k=4. Without diversity it would be [d1_c1, d1_c2, d1_c3, d1_c4]
+    # With diversity: Round 1 -> [d1_c1, d2_c1]. Round 2 -> [d1_c2, d1_c3]
+    results = retriever.search("query", top_k=4)
+    result_ids = [r[0].chunk_id for r in results]
+    assert result_ids == ["d1_c1", "d2_c1", "d1_c2", "d1_c3"]
+
+
+def test_hybrid_table_part_expansion_in_coverage_mode() -> None:
+    # 3 parts of the same table
+    t_metadata_1 = {"doc_id": "doc1", "table_index": 0, "table_part": 1, "table_part_count": 3}
+    t_metadata_2 = {"doc_id": "doc1", "table_index": 0, "table_part": 2, "table_part_count": 3}
+    t_metadata_3 = {"doc_id": "doc1", "table_index": 0, "table_part": 3, "table_part_count": 3}
+    
+    t_part1 = chunk("t_part1", metadata=t_metadata_1)
+    t_part2 = chunk("t_part2", metadata=t_metadata_2)
+    t_part3 = chunk("t_part3", metadata=t_metadata_3)
+    
+    # Another normal chunk
+    normal = chunk("normal", metadata={"doc_id": "doc1", "chunk_index": 10})
+    
+    dense = StubRetriever([(t_part2, 0.99), (normal, 0.90), (t_part3, 0.85)])
+    sparse = StubRetriever([])
+    
+    sparse.chunks = [t_part1, t_part2, t_part3, normal]
+    
+    retriever = HybridRetriever(dense, sparse)
+    
+    # Query without coverage intent -> narrow mode
+    results_narrow = retriever.search("điểm chuẩn", top_k=5)
+    result_ids_narrow = [r[0].chunk_id for r in results_narrow]
+    # Should only return what was retrieved
+    assert result_ids_narrow == ["t_part2", "normal", "t_part3"]
+    
+    # Query with coverage intent -> coverage mode
+    results_coverage = retriever.search("danh sách", top_k=5)
+    result_ids_cov = [r[0].chunk_id for r in results_coverage]
+    # table part 2 triggers expansion to all parts in order: 1, 2, 3
+    # then normal chunk is added.
+    # table part 3 is skipped later because it's already in seen_chunk_ids
+    assert result_ids_cov == ["t_part1", "t_part2", "t_part3", "normal"]
+    
+    # Test budget limit (now relaxed in coverage mode for downstream ContextAssembler)
+    results_budget = retriever.search("danh sách", top_k=2)
+    # max_results = 2 * 3 = 6. All 4 chunks fit into the relaxed buffer.
+    assert len(results_budget) == 4
+    assert [r[0].chunk_id for r in results_budget] == ["t_part1", "t_part2", "t_part3", "normal"]

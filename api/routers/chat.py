@@ -4,8 +4,12 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Any
+import json
+import queue
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.schemas import ChatRequest, ChatResponse, Citation, FeedbackRequest
@@ -78,8 +82,9 @@ def initialize_rag(
                 "Run scripts/ingest.py again."
             )
         llm_client = LLMClient(
-            api_key=settings.NVIDIA_API_KEY,
+            api_key=settings.LLM_API_KEY,
             model=settings.LLM_MODEL,
+            base_url=settings.LLM_BASE_URL,
             timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
             max_retries=settings.LLM_MAX_RETRIES,
         )
@@ -137,8 +142,8 @@ def rag_status() -> dict[str, Any]:
     }
 
 
-@router.post("", response_model=ChatResponse)
-async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)) -> ChatResponse:
+@router.post("")
+async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
     if rag_chain is None:
@@ -154,92 +159,92 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)) -> Chat
         session_id = session_memory.create_session()
 
     history_for_rag = session_memory.get_history(session_id, max_turns=5)
-    try:
-        response = await asyncio.to_thread(
-            rag_chain.answer,
-            request.message,
-            history_for_rag,
-        )
-    except LLMTimeoutError as exc:
-        logger.exception("Chat generation timed out")
-        raise _service_error(
-            status.HTTP_504_GATEWAY_TIMEOUT,
-            exc.code,
-            LLM_TIMEOUT_MESSAGE,
-        ) from exc
-    except LLMAuthenticationError as exc:
-        logger.exception("Chat generation failed because provider authentication was rejected")
-        raise _service_error(
-            status.HTTP_502_BAD_GATEWAY,
-            exc.code,
-            LLM_UNAVAILABLE_MESSAGE,
-        ) from exc
-    except LLMRateLimitError as exc:
-        logger.exception("Chat generation was rate limited by the provider")
-        raise _service_error(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            exc.code,
-            LLM_UNAVAILABLE_MESSAGE,
-        ) from exc
-    except LLMConnectionError as exc:
-        logger.exception("Chat generation could not reach the provider")
-        raise _service_error(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            exc.code,
-            LLM_UNAVAILABLE_MESSAGE,
-        ) from exc
-    except LLMProviderError as exc:
-        logger.exception("Chat generation failed at the provider")
-        raise _service_error(
-            status.HTTP_502_BAD_GATEWAY,
-            exc.code,
-            LLM_UNAVAILABLE_MESSAGE,
-        ) from exc
-    except RAGRetrievalError as exc:
-        logger.exception("Chat generation dependency failed")
-        raise _service_error(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "RAG_UNAVAILABLE",
-            RAG_UNAVAILABLE_MESSAGE,
-        ) from exc
-    except Exception as exc:
-        logger.exception("Unexpected chat generation failure")
-        raise _service_error(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            INTERNAL_ERROR_MESSAGE,
-        ) from exc
-
-    session_memory.add_message(session_id, "user", request.message)
-    session_memory.add_message(session_id, "assistant", response.answer)
-    citations_payload = response.citations
-    records = [
-        ChatMessage(session_id=session_id, role="user", content=request.message),
-        ChatMessage(
-            session_id=session_id,
-            role="assistant",
-            content=response.answer,
-            citations=citations_payload,
-            route_type=response.route_type,
-        ),
-    ]
-    if is_new_session:
-        records.insert(0, ChatSession(id=session_id))
-    db.add_all(records)
-    try:
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        logger.exception("Could not persist chat messages")
-        # Persistence is best-effort; a generated, grounded answer remains
-        # useful even when conversation storage is temporarily unavailable.
-
-    return ChatResponse(
-        answer=response.answer,
-        citations=[Citation(**citation) for citation in citations_payload],
-        route_type=response.route_type,
-        session_id=session_id,
-    )
+    
+    q = queue.Queue()
+    
+    def worker():
+        try:
+            for item in rag_chain.answer_stream(request.message, history_for_rag):
+                q.put(item)
+            q.put(None)
+        except Exception as e:
+            q.put(e)
+            
+    threading.Thread(target=worker, daemon=True).start()
+    
+    async def async_generator():
+        full_answer = ""
+        citations_payload = []
+        route_type_payload = "general"
+        
+        while True:
+            item = await asyncio.to_thread(q.get)
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                exc = item
+                if isinstance(exc, LLMTimeoutError):
+                    logger.exception("Chat generation timed out")
+                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_TIMEOUT_MESSAGE}, ensure_ascii=False)}\n\n"
+                elif isinstance(exc, LLMAuthenticationError):
+                    logger.exception("Chat generation failed because provider authentication was rejected")
+                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
+                elif isinstance(exc, LLMRateLimitError):
+                    logger.exception("Chat generation was rate limited by the provider")
+                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
+                elif isinstance(exc, LLMConnectionError):
+                    logger.exception("Chat generation could not reach the provider")
+                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
+                elif isinstance(exc, LLMProviderError):
+                    logger.exception("Chat generation failed at the provider")
+                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
+                elif isinstance(exc, RAGRetrievalError):
+                    logger.exception("Chat generation dependency failed")
+                    yield f"event: error\ndata: {json.dumps({'code': 'RAG_UNAVAILABLE', 'message': RAG_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
+                else:
+                    logger.exception("Unexpected chat generation failure")
+                    yield f"event: error\ndata: {json.dumps({'code': 'INTERNAL_ERROR', 'message': INTERNAL_ERROR_MESSAGE}, ensure_ascii=False)}\n\n"
+                return
+                
+            if item["type"] == "metadata":
+                citations_payload = item["citations"]
+                route_type_payload = item["route_type"]
+                payload = {
+                    "type": "metadata",
+                    "session_id": session_id,
+                    "citations": citations_payload,
+                    "route_type": route_type_payload
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            elif item["type"] == "chunk":
+                chunk_text = item["text"]
+                full_answer += chunk_text
+                yield f"data: {json.dumps({'type': 'chunk', 'text': chunk_text}, ensure_ascii=False)}\n\n"
+                
+        # Save to database
+        session_memory.add_message(session_id, "user", request.message)
+        session_memory.add_message(session_id, "assistant", full_answer)
+        
+        records = [
+            ChatMessage(session_id=session_id, role="user", content=request.message),
+            ChatMessage(
+                session_id=session_id,
+                role="assistant",
+                content=full_answer,
+                citations=citations_payload,
+                route_type=route_type_payload,
+            ),
+        ]
+        if is_new_session:
+            records.insert(0, ChatSession(id=session_id))
+        db.add_all(records)
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("Could not persist chat messages")
+            
+    return StreamingResponse(async_generator(), media_type="text/event-stream")
 
 
 @router.post("/feedback")

@@ -13,15 +13,7 @@ from src.ingestion.chunker import Chunk
 from src.retrieval.embedder import Embedder
 
 
-def chunk_embedding_text(chunk: Chunk) -> str:
-    """Include citation metadata that carries retrieval meaning, not payload IDs."""
-    metadata = chunk.metadata or {}
-    prefix = "\n".join(
-        value
-        for value in [str(metadata.get("title") or ""), str(metadata.get("section") or "")]
-        if value
-    )
-    return f"{prefix}\n{chunk.content}" if prefix else chunk.content
+from src.retrieval.document import chunk_search_text
 
 class NaiveDenseSearch:
     def __init__(
@@ -41,7 +33,7 @@ class NaiveDenseSearch:
                 raise ValueError("Precomputed embeddings must align with chunks")
             self.chunk_embeddings = matrix
         elif chunks:
-            texts = [chunk_embedding_text(chunk) for chunk in chunks]
+            texts = [chunk_search_text(chunk) for chunk in chunks]
             self.chunk_embeddings = self.embedder.embed(texts)
         else:
             self.chunk_embeddings = np.array([])
@@ -247,7 +239,7 @@ class QdrantDenseSearch:
         if embeddings is None:
             if self.embedder is None:
                 raise ValueError("embedder is required when embeddings are not provided")
-            vectors = self.embedder.embed([chunk.content for chunk in chunks])
+            vectors = self.embedder.embed([chunk_search_text(chunk) for chunk in chunks])
         else:
             vectors = embeddings
         matrix = self._validate_matrix(vectors, len(chunks))

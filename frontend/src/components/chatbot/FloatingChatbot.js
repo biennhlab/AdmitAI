@@ -5,7 +5,8 @@ import remarkGfm from 'remark-gfm';
 import {
   friendlyChatError,
   marksServiceUnavailable,
-  parseChatResponse
+  parseChatResponse,
+  parseChatStream
 } from '@/lib/chatErrors.mjs';
 import styles from './FloatingChatbot.module.css';
 
@@ -110,22 +111,29 @@ export default function FloatingChatbot() {
         body: JSON.stringify(payload)
       });
       
-      const data = await parseChatResponse(response);
       setServiceStatus('available');
+      const newBotMsgId = Date.now() + 1;
       
-      if (data.session_id && data.session_id !== sessionIdRef.current) {
-        sessionIdRef.current = data.session_id;
-        localStorage.setItem('admitai_session_id', data.session_id);
-      }
-      
-      const newBotMsg = {
-        id: Date.now() + 1,
+      setMessages((prev) => [...prev, {
+        id: newBotMsgId,
         role: 'bot',
-        content: data.answer,
-        citations: data.citations || []
-      };
+        content: '',
+        citations: []
+      }]);
       
-      setMessages((prev) => [...prev, newBotMsg]);
+      await parseChatStream(response, (textChunk) => {
+        setMessages(prev => prev.map(msg => 
+          msg.id === newBotMsgId ? { ...msg, content: msg.content + textChunk } : msg
+        ));
+      }, (metadata) => {
+        if (metadata.session_id && metadata.session_id !== sessionIdRef.current) {
+          sessionIdRef.current = metadata.session_id;
+          localStorage.setItem('admitai_session_id', metadata.session_id);
+        }
+        setMessages(prev => prev.map(msg => 
+          msg.id === newBotMsgId ? { ...msg, citations: metadata.citations || [] } : msg
+        ));
+      });
     } catch (error) {
       console.error('Chat error:', error);
       const isOnline = typeof navigator === 'undefined' || navigator.onLine !== false;

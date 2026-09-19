@@ -26,7 +26,7 @@ from src.retrieval import (
     read_manifest,
     save_dense_index,
 )
-from src.retrieval.dense_search import chunk_embedding_text
+from src.retrieval.document import chunk_search_text
 
 
 def corpus_fingerprint(documents: list, module: int) -> str:
@@ -113,7 +113,7 @@ def embed_chunks(embedder: Embedder, chunks: list[Chunk]) -> tuple[list[Chunk], 
     for batch_number, start in enumerate(range(0, len(chunks), batch_size), start=1):
         batch = chunks[start : start + batch_size]
         try:
-            matrix = embedder.embed([chunk_embedding_text(chunk) for chunk in batch])
+            matrix = embedder.embed([chunk_search_text(chunk) for chunk in batch])
             if matrix.ndim != 2 or matrix.shape[0] != len(batch):
                 raise ValueError("Embedding provider returned an invalid matrix")
             successful_chunks.extend(batch)
@@ -121,7 +121,7 @@ def embed_chunks(embedder: Embedder, chunks: list[Chunk]) -> tuple[list[Chunk], 
         except Exception as batch_exc:
             for chunk in batch:
                 try:
-                    vector = embedder.embed([chunk_embedding_text(chunk)])
+                    vector = embedder.embed([chunk_search_text(chunk)])
                     successful_chunks.append(chunk)
                     matrices.append(vector)
                 except Exception as exc:

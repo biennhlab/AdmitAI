@@ -29,7 +29,7 @@ def test_llm_client_generation():
         mock_response.choices[0].message.content = "This is a mock answer."
         mock_client_instance.chat.completions.create.return_value = mock_response
 
-        client = LLMClient(api_key="fake_key", model="fake-model")
+        client = LLMClient(api_key="fake_key", model="fake-model", base_url="fake-url")
         answer = client.generate("system prompt", [{"role": "user", "content": "hello"}])
         
         assert answer == "This is a mock answer."
@@ -41,7 +41,7 @@ def test_llm_client_error():
         MockOpenAI.return_value = mock_client_instance
         mock_client_instance.chat.completions.create.side_effect = Exception("API Error")
 
-        client = LLMClient(api_key="fake", model="fake")
+        client = LLMClient(api_key="fake", model="fake", base_url="fake-url")
         with pytest.raises(LLMUpstreamError, match="unexpected error"):
             client.generate("sys", [])
 

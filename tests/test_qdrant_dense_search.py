@@ -83,12 +83,14 @@ def _chunks():
     ]
 
 
+from src.retrieval.document import chunk_search_text
+
 def test_index_preserves_chunk_vector_and_citation_mapping(qdrant):
     chunks = _chunks()
     vectors = {
-        chunks[0].content: [1.0, 0.0, 0.0],
-        chunks[1].content: [0.0, 1.0, 0.0],
-        chunks[2].content: [0.0, 0.0, 1.0],
+        chunk_search_text(chunks[0]): [1.0, 0.0, 0.0],
+        chunk_search_text(chunks[1]): [0.0, 1.0, 0.0],
+        chunk_search_text(chunks[2]): [0.0, 0.0, 1.0],
     }
     search = QdrantDenseSearch(qdrant, "chunks", FakeEmbedder(vectors))
 
@@ -114,16 +116,16 @@ def test_index_preserves_chunk_vector_and_citation_mapping(qdrant):
             "citation_label",
         ):
             assert point.payload[citation_key] == chunk.metadata[citation_key]
-        np.testing.assert_allclose(point.vector, vectors[chunk.content])
+        np.testing.assert_allclose(point.vector, vectors[chunk_search_text(chunk)])
 
 
 def test_search_ranking_top_k_filters_and_vietnamese(qdrant):
     chunks = _chunks()
     embedder = FakeEmbedder(
         {
-            chunks[0].content: [1.0, 0.0],
-            chunks[1].content: [0.8, 0.6],
-            chunks[2].content: [0.0, 1.0],
+            chunk_search_text(chunks[0]): [1.0, 0.0],
+            chunk_search_text(chunks[1]): [0.8, 0.6],
+            chunk_search_text(chunks[2]): [0.0, 1.0],
         },
         {"ngành nào có điểm chuẩn cao?": [1.0, 0.0]},
     )
@@ -168,22 +170,22 @@ def test_empty_index_returns_no_results_without_embedding(qdrant):
 
 def test_reindex_is_idempotent_and_updates_same_point(qdrant):
     chunks = _chunks()[:2]
+    updated = Chunk(
+        chunk_id=chunks[0].chunk_id,
+        content="Nội dung đã cập nhật",
+        metadata={**chunks[0].metadata, "title": "Tiêu đề mới"},
+    )
     embedder = FakeEmbedder(
         {
-            chunks[0].content: [1.0, 0.0],
-            chunks[1].content: [0.0, 1.0],
-            "Nội dung đã cập nhật": [0.6, 0.8],
+            chunk_search_text(chunks[0]): [1.0, 0.0],
+            chunk_search_text(chunks[1]): [0.0, 1.0],
+            chunk_search_text(updated): [0.6, 0.8],
         }
     )
     search = QdrantDenseSearch(qdrant, "chunks", embedder)
     search.index(chunks)
     original_point_id = search._point_id(chunks[0].chunk_id)
 
-    updated = Chunk(
-        chunk_id=chunks[0].chunk_id,
-        content="Nội dung đã cập nhật",
-        metadata={**chunks[0].metadata, "title": "Tiêu đề mới"},
-    )
     search.index([updated])
 
     assert qdrant.count("chunks", exact=True).count == 2
@@ -196,9 +198,9 @@ def test_delete_by_source_is_exact_and_does_not_affect_other_sources(qdrant):
     chunks = _chunks()
     embedder = FakeEmbedder(
         {
-            chunks[0].content: [1.0, 0.0],
-            chunks[1].content: [0.0, 1.0],
-            chunks[2].content: [0.7, 0.7],
+            chunk_search_text(chunks[0]): [1.0, 0.0],
+            chunk_search_text(chunks[1]): [0.0, 1.0],
+            chunk_search_text(chunks[2]): [0.7, 0.7],
         }
     )
     search = QdrantDenseSearch(qdrant, "chunks", embedder)
@@ -220,7 +222,7 @@ def test_existing_collection_dimension_mismatch_is_non_destructive(qdrant):
     search = QdrantDenseSearch(
         qdrant,
         "chunks",
-        FakeEmbedder({chunk.content: [1.0, 0.0, 0.0]}),
+        FakeEmbedder({chunk_search_text(chunk): [1.0, 0.0, 0.0]}),
     )
 
     with pytest.raises(ValueError, match="vector size 2.*returns 3.*no data was deleted"):
@@ -238,7 +240,7 @@ def test_existing_collection_distance_mismatch_is_non_destructive(qdrant):
     search = QdrantDenseSearch(
         qdrant,
         "chunks",
-        FakeEmbedder({chunk.content: [1.0, 0.0]}),
+        FakeEmbedder({chunk_search_text(chunk): [1.0, 0.0]}),
     )
 
     with pytest.raises(ValueError, match="requires Cosine.*no data was changed"):
@@ -280,7 +282,7 @@ def test_qdrant_unavailable_errors_are_not_silenced():
 def test_invalid_query_vector_and_top_k_are_rejected(qdrant):
     chunk = _chunks()[0]
     embedder = FakeEmbedder(
-        {chunk.content: [1.0, 0.0]},
+        {chunk_search_text(chunk): [1.0, 0.0]},
         {"bad": [np.inf, 0.0], "zero": [0.0, 0.0]},
     )
     search = QdrantDenseSearch(qdrant, "chunks", embedder)

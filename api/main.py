@@ -48,8 +48,8 @@ app.add_middleware(
 
 
 def _llm_is_configured() -> bool:
-    key = settings.NVIDIA_API_KEY.strip()
-    return bool(key) and key.lower() not in {"placeholder", "your_nvidia_api_key_here"}
+    key = settings.LLM_API_KEY.strip()
+    return bool(key) and key.lower() not in {"placeholder", "your_gemini_api_key_here"}
 
 
 def load_local_index() -> tuple[list[Any], dict[str, Any]]:
@@ -101,7 +101,11 @@ def load_hybrid_retriever(
         dense_search.validate_ready(int(manifest["embedding_dimension"]))
         sparse_search = BM25Search()
         sparse_search.index(chunks)
-        retriever = HybridRetriever(dense_search, sparse_search)
+        retriever = HybridRetriever(
+            dense_search, 
+            sparse_search,
+            parent_chunks=manifest.get("parent_chunks")
+        )
         return client, retriever, manifest
     except Exception:
         client.close()
@@ -154,10 +158,10 @@ async def startup_event():
     if not app.state.components["llm"]["configured"]:
         client.close()
         chat.mark_rag_unavailable(
-            RuntimeError("NVIDIA_API_KEY is not configured"),
+            RuntimeError("LLM_API_KEY is not configured"),
             "Dịch vụ xử lý câu hỏi đang tạm thời chưa sẵn sàng.",
         )
-        logger.error("NVIDIA_API_KEY is not configured; API is running in degraded mode")
+        logger.error("LLM_API_KEY is not configured; API is running in degraded mode")
         return
 
     try:

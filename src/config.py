@@ -1,8 +1,9 @@
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    NVIDIA_API_KEY: str = "placeholder"
-    LLM_MODEL: str = "meta/llama-3.1-70b-instruct"
+    LLM_API_KEY: str = "placeholder"
+    LLM_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    LLM_MODEL: str = "gemma-4-26b-a4b-it"
     LLM_TIMEOUT_SECONDS: float = 30.0
     LLM_MAX_RETRIES: int = 1
     JWT_SECRET_KEY: str = "secret"
@@ -18,6 +19,7 @@ class Settings(BaseSettings):
     RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
     
     RETRIEVAL_TOP_K: int = 20
+    RETRIEVAL_CANDIDATE_MULTIPLIER: int = 3
     RERANK_TOP_K: int = 5
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 100

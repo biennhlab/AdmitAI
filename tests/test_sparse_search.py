@@ -96,3 +96,16 @@ def test_empty_upsert_does_not_clear_existing_corpus() -> None:
     search.index([chunk("one", "học phí")])
     search.index([])
     assert [item.chunk_id for item, _ in search.search("học")] == ["one"]
+
+def test_metadata_indexing_and_punctuation_normalization() -> None:
+    relevant = chunk("meta", "Nội dung chính.")
+    relevant.metadata = {"title": "Đề án", "heading": "Ngành An toàn thông tin, CNTT!"}
+    search = BM25Search()
+    search.index([relevant])
+
+    # Should match metadata
+    results = search.search("an toàn")
+    assert results and results[0][0] is relevant
+    
+    # Should ignore punctuation
+    assert tokenize("CNTT, An toàn!") == ["cntt", "an", "toàn"]
