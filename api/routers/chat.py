@@ -26,7 +26,7 @@ from src.generation.llm_client import (
 )
 from src.generation.rag_chain import RAGChain, RAGRetrievalError
 from src.generation.session_memory import SessionMemory
-from src.retrieval import Embedder, NaiveDenseSearch, load_dense_index
+from src.retrieval import Embedder, NaiveDenseSearch, Reranker, load_dense_index
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -88,6 +88,10 @@ def initialize_rag(
             timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
             max_retries=settings.LLM_MAX_RETRIES,
         )
+        reranker = Reranker(
+            model_name=settings.RERANKER_MODEL,
+            batch_size=settings.RERANK_BATCH_SIZE,
+        )
         rag_chain = RAGChain(
             retriever,
             llm_client,
@@ -95,6 +99,8 @@ def initialize_rag(
             # Dense cosine thresholds are not meaningful for RRF scores.
             min_score=None if is_injected else settings.RETRIEVAL_MIN_SCORE,
             min_lexical_coverage=settings.RETRIEVAL_MIN_LEXICAL_COVERAGE,
+            reranker=reranker,
+            rerank_top_k=settings.RERANK_TOP_K,
         )
         rag_manifest = loaded_manifest
         rag_initialization_error = None

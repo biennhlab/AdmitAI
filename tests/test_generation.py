@@ -19,6 +19,16 @@ class MockRetriever:
         # Return a list of tuples (Chunk, score)
         return [(chunk, 0.9) for chunk in self.chunks[:top_k]]
 
+
+class ScoredRetriever:
+    def __init__(self, results):
+        self.results = results
+        self.calls = []
+
+    def search(self, question, top_k=5):
+        self.calls.append((question, top_k))
+        return list(self.results)
+
 def test_llm_client_generation():
     # Mock LLMClient
     with patch("src.generation.llm_client.OpenAI") as MockOpenAI:
@@ -221,3 +231,172 @@ def test_rag_chain_empty_question():
     
     # Invalid input must not spend an LLM call or fabricate an answer.
     mock_llm.generate.assert_not_called()
+
+
+def test_reranker_controls_final_context_and_citations() -> None:
+    first = MockChunk("first", "tuition details first", {"source": "first.pdf"})
+    dropped = MockChunk("dropped", "tuition details dropped", {"source": "dropped.pdf"})
+    best = MockChunk("best", "tuition details best", {"source": "best.pdf"})
+    retrieved = [(first, 0.8), (dropped, 0.7), (best, 0.6)]
+    retriever = ScoredRetriever(retrieved)
+    reranker = MagicMock()
+    reranker.rerank.return_value = [
+        (best, 0.6, 0.95),
+        (first, 0.8, 0.55),
+    ]
+    llm = MagicMock()
+    llm.generate.return_value = "best answer [1]"
+
+    response = RAGChain(
+        retriever,
+        llm,
+        reranker=reranker,
+        rerank_top_k=2,
+    ).answer("tuition details")
+
+    assert retriever.calls == [("tuition details", 5)]
+    reranker.rerank.assert_called_once_with(
+        "tuition details",
+        retrieved,
+        top_k=2,
+    )
+    assert [citation["chunk_id"] for citation in response.citations] == ["best", "first"]
+    assert [citation["score"] for citation in response.citations] == [0.95, 0.55]
+    system_prompt = llm.generate.call_args.kwargs["system_prompt"]
+    assert system_prompt.index("tuition details best") < system_prompt.index("tuition details first")
+    assert "tuition details dropped" not in system_prompt
+    assert "retrieval_score=" not in system_prompt
+
+
+def test_rerank_top_k_defaults_to_settings() -> None:
+    reranker = MagicMock()
+    with patch("src.generation.rag_chain.settings.RERANK_TOP_K", 3):
+        chain = RAGChain(MockRetriever([]), MagicMock(), reranker=reranker)
+
+    assert chain.rerank_top_k == 3
+
+
+def test_empty_retrieval_does_not_call_reranker() -> None:
+    reranker = MagicMock()
+    llm = MagicMock()
+
+    response = RAGChain(MockRetriever([]), llm, reranker=reranker).answer("tuition details")
+
+    assert response.answer == FALLBACK_ANSWER
+    reranker.rerank.assert_not_called()
+    llm.generate.assert_not_called()
+
+
+def test_lexical_evidence_is_checked_after_reranking() -> None:
+    relevant = MockChunk("relevant", "tuition details for the program")
+    irrelevant = MockChunk("irrelevant", "campus trees and sports")
+    reranker = MagicMock()
+    reranker.rerank.return_value = [(irrelevant, 0.7, 0.99)]
+    llm = MagicMock()
+
+    response = RAGChain(
+        ScoredRetriever([(relevant, 0.8), (irrelevant, 0.7)]),
+        llm,
+        reranker=reranker,
+        rerank_top_k=1,
+    ).answer("tuition details")
+
+    assert response.answer == FALLBACK_ANSWER
+    assert response.citations == []
+    llm.generate.assert_not_called()
+
+
+def test_reranker_failure_falls_back_to_retrieval_order(caplog) -> None:
+    first = MockChunk("first", "tuition details first")
+    second = MockChunk("second", "tuition details second")
+    reranker = MagicMock()
+    reranker.rerank.side_effect = RuntimeError("model unavailable")
+    llm = MagicMock()
+    llm.generate.return_value = "fallback answer"
+
+    response = RAGChain(
+        ScoredRetriever([(first, 0.8), (second, 0.6)]),
+        llm,
+        reranker=reranker,
+    ).answer("tuition details")
+
+    assert [citation["chunk_id"] for citation in response.citations] == ["first", "second"]
+    assert [citation["score"] for citation in response.citations] == [0.8, 0.6]
+    system_prompt = llm.generate.call_args.kwargs["system_prompt"]
+    assert system_prompt.index("tuition details first") < system_prompt.index("tuition details second")
+    assert "continuing with retrieval-ranked evidence" in caplog.text
+
+
+def test_duplicate_citation_identity_is_removed_before_numbering() -> None:
+    original = MockChunk(
+        "same-chunk",
+        "tuition details primary",
+        {"doc_id": "doc", "page_number": 4, "source": "source.pdf"},
+    )
+    duplicate = MockChunk(
+        "same-chunk",
+        "tuition details duplicate",
+        {"doc_id": "doc", "page_number": 4, "source": "source.pdf"},
+    )
+    llm = MagicMock()
+    llm.generate.return_value = "answer [1]"
+
+    response = RAGChain(MockRetriever([original, duplicate]), llm).answer("tuition details")
+
+    assert len(response.citations) == 1
+    assert response.citations[0]["chunk_id"] == "same-chunk"
+    system_prompt = llm.generate.call_args.kwargs["system_prompt"]
+    assert system_prompt.count("<document ") == 1
+    assert 'id="1"' in system_prompt
+    assert 'id="2"' not in system_prompt
+    assert "tuition details duplicate" not in system_prompt
+
+
+def test_missing_metadata_still_produces_a_valid_citation() -> None:
+    chunk = MockChunk(None, "admission details", {})
+    llm = MagicMock()
+    llm.generate.return_value = "answer [1]"
+
+    response = RAGChain(MockRetriever([chunk]), llm).answer("admission details")
+
+    assert response.citations == [
+        {
+            "doc_id": "",
+            "title": "Chunk None",
+            "source": "Chunk None",
+            "source_url": "",
+            "source_type": "",
+            "published_at": "",
+            "retrieved_at": "",
+            "page": None,
+            "section": None,
+            "snippet": "admission details",
+            "score": 0.9,
+            "chunk_id": "None",
+        }
+    ]
+
+
+def test_streaming_uses_the_same_reranked_evidence() -> None:
+    first = MockChunk("first", "tuition details first")
+    best = MockChunk("best", "tuition details best")
+    reranker = MagicMock()
+    reranker.rerank.return_value = [(best, 0.6, 0.9)]
+    llm = MagicMock()
+    llm.generate_stream.return_value = iter(["stream answer [1]"])
+    chain = RAGChain(
+        ScoredRetriever([(first, 0.8), (best, 0.6)]),
+        llm,
+        reranker=reranker,
+        rerank_top_k=1,
+    )
+
+    events = list(chain.answer_stream("tuition details"))
+
+    assert events[0]["type"] == "metadata"
+    assert [citation["chunk_id"] for citation in events[0]["citations"]] == ["best"]
+    assert events[0]["citations"][0]["score"] == 0.9
+    assert "".join(event["text"] for event in events[1:]) == "stream answer [1]"
+    system_prompt = llm.generate_stream.call_args.kwargs["system_prompt"]
+    assert "tuition details best" in system_prompt
+    assert "tuition details first" not in system_prompt

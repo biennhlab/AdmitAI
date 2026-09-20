@@ -96,6 +96,41 @@ async def request(method: str, path: str, *, json=None, db=None):
         return await client.request(method, path, json=json)
 
 
+def test_initialize_rag_constructs_one_process_wide_reranker() -> None:
+    chunk = MagicMock()
+    chunk.chunk_id = "chunk-1"
+    chunk.content = "tuition details"
+    chunk.metadata = {"doc_id": "doc-1", "source": "source.pdf"}
+    retriever = MagicMock()
+    retriever.search.return_value = [(chunk, 0.8)]
+    reranker = MagicMock()
+    reranker.rerank.return_value = [(chunk, 0.8, 0.95)]
+    llm = MagicMock()
+    llm.generate.return_value = "answer [1]"
+    manifest = {
+        "document_count": 1,
+        "chunk_count": 1,
+        "embedding_model": "BAAI/bge-m3",
+        "retrieval_backend": "test",
+    }
+
+    with (
+        patch("api.routers.chat.Reranker", return_value=reranker) as reranker_factory,
+        patch("api.routers.chat.LLMClient", return_value=llm),
+    ):
+        chat.initialize_rag(retriever=retriever, manifest=manifest)
+        assert chat.rag_chain is not None
+        chat.rag_chain.answer("tuition details")
+        chat.rag_chain.answer("tuition details")
+
+    reranker_factory.assert_called_once_with(
+        model_name=chat.settings.RERANKER_MODEL,
+        batch_size=chat.settings.RERANK_BATCH_SIZE,
+    )
+    assert chat.rag_chain.reranker is reranker
+    assert reranker.rerank.call_count == 2
+
+
 @pytest.mark.asyncio
 async def test_health_reports_each_ready_component_without_secrets():
     chat.rag_chain = object()
