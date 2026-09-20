@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     RETRIEVAL_TOP_K: int = 20
     RETRIEVAL_CANDIDATE_MULTIPLIER: int = 3
     RERANK_TOP_K: int = 5
+    RERANK_BATCH_SIZE: int = 16
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 100
     TABLE_CHUNK_SIZE: int = 500
