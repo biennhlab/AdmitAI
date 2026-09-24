@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -52,6 +53,16 @@ class FakeRAG:
             raise self.error
         return self.result
 
+    def answer_stream(self, question, history):
+        if self.error:
+            raise self.error
+        yield {
+            "type": "metadata",
+            "citations": self.result.citations,
+            "route_type": self.result.route_type,
+        }
+        yield {"type": "chunk", "text": self.result.answer}
+
 
 @pytest.fixture(autouse=True)
 def restore_chat_state():
@@ -96,6 +107,14 @@ async def request(method: str, path: str, *, json=None, db=None):
         return await client.request(method, path, json=json)
 
 
+def sse_payloads(response: httpx.Response) -> list[dict]:
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
 def test_initialize_rag_constructs_one_process_wide_reranker() -> None:
     chunk = MagicMock()
     chunk.chunk_id = "chunk-1"
@@ -128,6 +147,8 @@ def test_initialize_rag_constructs_one_process_wide_reranker() -> None:
         batch_size=chat.settings.RERANK_BATCH_SIZE,
     )
     assert chat.rag_chain.reranker is reranker
+    assert chat.rag_chain.self_rag.llm_client is llm
+    assert chat.rag_chain.query_rewriter.llm_client is llm
     assert reranker.rerank.call_count == 2
 
 
@@ -305,7 +326,8 @@ async def test_database_persistence_failure_does_not_discard_generated_answer():
     )
 
     assert response.status_code == 200
-    assert response.json()["answer"] == "Câu trả lời [1]"
+    payloads = sse_payloads(response)
+    assert payloads[-1] == {"type": "chunk", "text": "Câu trả lời [1]"}
     assert failing_db.rollback_called is True
 
 

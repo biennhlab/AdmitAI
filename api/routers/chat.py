@@ -25,7 +25,9 @@ from src.generation.llm_client import (
     LLMTimeoutError,
 )
 from src.generation.rag_chain import RAGChain, RAGRetrievalError
+from src.generation.self_rag import SelfRAG
 from src.generation.session_memory import SessionMemory
+from src.query_transform import QueryRewriter
 from src.retrieval import Embedder, NaiveDenseSearch, Reranker, load_dense_index
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,61 @@ def _service_error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(
         status_code=status_code,
         detail={"code": code, "message": message},
+    )
+
+
+def _generation_http_error(exc: Exception) -> HTTPException:
+    """Map failures raised before the first SSE event to safe HTTP errors."""
+    if isinstance(exc, LLMTimeoutError):
+        logger.error("Chat generation timed out")
+        return _service_error(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            exc.code,
+            LLM_TIMEOUT_MESSAGE,
+        )
+    if isinstance(exc, LLMAuthenticationError):
+        logger.error("Chat generation failed because provider authentication was rejected")
+        return _service_error(
+            status.HTTP_502_BAD_GATEWAY,
+            exc.code,
+            LLM_UNAVAILABLE_MESSAGE,
+        )
+    if isinstance(exc, (LLMRateLimitError, LLMConnectionError)):
+        logger.error("Chat generation provider is unavailable")
+        return _service_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            exc.code,
+            LLM_UNAVAILABLE_MESSAGE,
+        )
+    if isinstance(exc, LLMProviderError):
+        logger.error("Chat generation failed at the provider")
+        return _service_error(
+            status.HTTP_502_BAD_GATEWAY,
+            exc.code,
+            LLM_UNAVAILABLE_MESSAGE,
+        )
+    if isinstance(exc, RAGRetrievalError):
+        logger.error("Chat generation dependency failed")
+        return _service_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "RAG_UNAVAILABLE",
+            RAG_UNAVAILABLE_MESSAGE,
+        )
+    logger.error("Unexpected chat generation failure")
+    return _service_error(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "INTERNAL_ERROR",
+        INTERNAL_ERROR_MESSAGE,
+    )
+
+
+def _stream_error_event(exc: Exception) -> str:
+    """Return a safe SSE error for a failure after streaming has started."""
+    error = _generation_http_error(exc)
+    detail = error.detail
+    return (
+        "event: error\n"
+        f"data: {json.dumps(detail, ensure_ascii=False)}\n\n"
     )
 
 
@@ -92,6 +149,8 @@ def initialize_rag(
             model_name=settings.RERANKER_MODEL,
             batch_size=settings.RERANK_BATCH_SIZE,
         )
+        self_rag = SelfRAG(llm_client)
+        query_rewriter = QueryRewriter(llm_client)
         rag_chain = RAGChain(
             retriever,
             llm_client,
@@ -101,6 +160,10 @@ def initialize_rag(
             min_lexical_coverage=settings.RETRIEVAL_MIN_LEXICAL_COVERAGE,
             reranker=reranker,
             rerank_top_k=settings.RERANK_TOP_K,
+            self_rag=self_rag,
+            query_rewriter=query_rewriter,
+            max_relevance_retries=1,
+            max_faithfulness_retries=1,
         )
         rag_manifest = loaded_manifest
         rag_initialization_error = None
@@ -175,43 +238,35 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
             q.put(None)
         except Exception as e:
             q.put(e)
-            
+
     threading.Thread(target=worker, daemon=True).start()
-    
+
+    # Self-RAG completes relevance, buffered generation, and faithfulness before
+    # yielding metadata. Waiting for that first item prevents unverified content
+    # from committing an HTTP 200 and preserves meaningful pre-stream errors.
+    first_item = await asyncio.to_thread(q.get)
+    if isinstance(first_item, Exception):
+        raise _generation_http_error(first_item)
+
     async def async_generator():
         full_answer = ""
         citations_payload = []
         route_type_payload = "general"
-        
+
+        pending_item = first_item
+        has_pending_item = True
         while True:
-            item = await asyncio.to_thread(q.get)
+            if has_pending_item:
+                item = pending_item
+                has_pending_item = False
+            else:
+                item = await asyncio.to_thread(q.get)
             if item is None:
                 break
             if isinstance(item, Exception):
-                exc = item
-                if isinstance(exc, LLMTimeoutError):
-                    logger.exception("Chat generation timed out")
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_TIMEOUT_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, LLMAuthenticationError):
-                    logger.exception("Chat generation failed because provider authentication was rejected")
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, LLMRateLimitError):
-                    logger.exception("Chat generation was rate limited by the provider")
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, LLMConnectionError):
-                    logger.exception("Chat generation could not reach the provider")
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, LLMProviderError):
-                    logger.exception("Chat generation failed at the provider")
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, RAGRetrievalError):
-                    logger.exception("Chat generation dependency failed")
-                    yield f"event: error\ndata: {json.dumps({'code': 'RAG_UNAVAILABLE', 'message': RAG_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                else:
-                    logger.exception("Unexpected chat generation failure")
-                    yield f"event: error\ndata: {json.dumps({'code': 'INTERNAL_ERROR', 'message': INTERNAL_ERROR_MESSAGE}, ensure_ascii=False)}\n\n"
+                yield _stream_error_event(item)
                 return
-                
+
             if item["type"] == "metadata":
                 citations_payload = item["citations"]
                 route_type_payload = item["route_type"]
@@ -226,7 +281,7 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
                 chunk_text = item["text"]
                 full_answer += chunk_text
                 yield f"data: {json.dumps({'type': 'chunk', 'text': chunk_text}, ensure_ascii=False)}\n\n"
-                
+
         # Save to database
         session_memory.add_message(session_id, "user", request.message)
         session_memory.add_message(session_id, "assistant", full_answer)

@@ -4,18 +4,28 @@ from dataclasses import dataclass
 import logging
 import math
 import re
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 from src.config import settings
+from src.query_transform import QueryRewriter
 
 from .assembler import ContextAssembler
 from .prompts import SYSTEM_PROMPT, build_rag_prompt, format_citations
+from .self_rag import RAGAction, SelfRAG
 
 
 FALLBACK_ANSWER = "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có."
 
 
 logger = logging.getLogger(__name__)
+
+
+CORRECTIVE_GENERATION_INSTRUCTION = (
+    "\n\n<corrective_instruction>\n"
+    "Chỉ giữ các nhận định được context hỗ trợ trực tiếp. Không thêm thông tin "
+    "không có căn cứ. Nếu context không đủ, hãy nói chưa đủ dữ liệu.\n"
+    "</corrective_instruction>"
+)
 
 
 class RAGRetrievalError(RuntimeError):
@@ -52,7 +62,18 @@ class RAGChain:
         min_lexical_coverage: float = 0.34,
         reranker: Any | None = None,
         rerank_top_k: int | None = None,
+        self_rag: SelfRAG | None = None,
+        query_rewriter: QueryRewriter | None = None,
+        max_relevance_retries: int = 1,
+        max_faithfulness_retries: int = 1,
     ):
+        for name, value in (
+            ("max_relevance_retries", max_relevance_retries),
+            ("max_faithfulness_retries", max_faithfulness_retries),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+                raise ValueError(f"{name} must be either 0 or 1")
+
         self.retriever = retriever
         self.llm_client = llm_client
         self.top_k = top_k
@@ -64,6 +85,14 @@ class RAGChain:
             if reranker is not None and rerank_top_k is None
             else rerank_top_k
         )
+        self.self_rag = self_rag
+        self.query_rewriter = (
+            query_rewriter
+            if self_rag is not None and query_rewriter is not None
+            else QueryRewriter(llm_client) if self_rag is not None else None
+        )
+        self.max_relevance_retries = max_relevance_retries
+        self.max_faithfulness_retries = max_faithfulness_retries
 
     @staticmethod
     def _evidence_tokens(text: str) -> set[str]:
@@ -205,11 +234,15 @@ class RAGChain:
         question: str,
         session_history: Optional[List[dict]],
         evidence: list[RankedEvidence],
+        *,
+        corrective: bool = False,
     ) -> tuple[str, list[dict[str, str]], list[dict[str, Any]]]:
         chunks = [item.chunk for item in evidence]
         # Ranking scores are internal signals and do not belong in the prompt.
         context = format_citations(chunks)
         system_prompt = SYSTEM_PROMPT.format(context=context)
+        if corrective:
+            system_prompt += CORRECTIVE_GENERATION_INSTRUCTION
 
         messages: list[dict[str, str]] = []
         if session_history:
@@ -226,6 +259,48 @@ class RAGChain:
             for item in evidence
         ]
         return system_prompt, messages, citations
+
+    @staticmethod
+    def _context_for_evidence(evidence: list[RankedEvidence]) -> str:
+        return format_citations([item.chunk for item in evidence])
+
+    def _generate_answer(
+        self,
+        question: str,
+        session_history: Optional[List[dict]],
+        evidence: list[RankedEvidence],
+        *,
+        corrective: bool = False,
+    ) -> str:
+        system_prompt, messages, _citations = self._generation_inputs(
+            question,
+            session_history,
+            evidence,
+            corrective=corrective,
+        )
+        return self._clean_answer(
+            self.llm_client.generate(system_prompt=system_prompt, messages=messages)
+        )
+
+    def _generate_buffered_stream_answer(
+        self,
+        question: str,
+        session_history: Optional[List[dict]],
+        evidence: list[RankedEvidence],
+        *,
+        corrective: bool = False,
+    ) -> str:
+        system_prompt, messages, _citations = self._generation_inputs(
+            question,
+            session_history,
+            evidence,
+            corrective=corrective,
+        )
+        generator = self.llm_client.generate_stream(
+            system_prompt=system_prompt,
+            messages=messages,
+        )
+        return self._clean_answer("".join(generator))
 
     @staticmethod
     def _clean_answer(answer: str) -> str:
@@ -245,7 +320,176 @@ class RAGChain:
         )
         return cleaned.strip()
 
+    @staticmethod
+    def _fallback_response() -> RAGResponse:
+        return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
+
+    @staticmethod
+    def _same_query(left: str, right: str) -> bool:
+        normalize = lambda value: " ".join(value.split()).casefold()
+        return normalize(left) == normalize(right)
+
+    def _check_relevance(self, question: str, context: str) -> RAGAction | None:
+        try:
+            result = self.self_rag.check_relevance(question, context)
+            action = result.action
+        except Exception:
+            logger.warning("Self-RAG checker unavailable; returning fallback", exc_info=True)
+            return None
+        if action not in (RAGAction.ACCEPT, RAGAction.RETRY, RAGAction.FALLBACK):
+            logger.warning("Self-RAG checker unavailable; returning fallback")
+            return None
+        return action
+
+    def _check_faithfulness(
+        self,
+        question: str,
+        answer: str,
+        context: str,
+    ) -> RAGAction | None:
+        try:
+            result = self.self_rag.check_faithfulness(question, answer, context)
+            action = result.action
+        except Exception:
+            logger.warning("Self-RAG checker unavailable; returning fallback", exc_info=True)
+            return None
+        if action not in (RAGAction.ACCEPT, RAGAction.RETRY, RAGAction.FALLBACK):
+            logger.warning("Self-RAG checker unavailable; returning fallback")
+            return None
+        return action
+
+    def _run_grounded_pipeline(
+        self,
+        question: str,
+        session_history: Optional[List[dict]] = None,
+        *,
+        answer_generator: Callable[..., str] | None = None,
+    ) -> RAGResponse:
+        if not question or not question.strip():
+            return self._fallback_response()
+
+        original_question = question.strip()
+        evidence = self._retrieve_and_prepare(original_question)
+        if not evidence:
+            return self._fallback_response()
+
+        if self.self_rag is not None:
+            context = self._context_for_evidence(evidence)
+            relevance_action = self._check_relevance(original_question, context)
+            if relevance_action is None or relevance_action is RAGAction.FALLBACK:
+                if relevance_action is RAGAction.FALLBACK:
+                    logger.warning("Self-RAG checker unavailable; returning fallback")
+                return self._fallback_response()
+            if relevance_action is RAGAction.RETRY:
+                if self.max_relevance_retries == 0 or self.query_rewriter is None:
+                    logger.warning("Self-RAG relevance retry failed; returning fallback")
+                    return self._fallback_response()
+                logger.info(
+                    "Self-RAG relevance check failed; starting corrective retrieval; retry_count=1"
+                )
+                try:
+                    rewritten_question = self.query_rewriter.rewrite(original_question)
+                except Exception:
+                    logger.warning(
+                        "Self-RAG query rewrite failed; returning fallback",
+                        exc_info=True,
+                    )
+                    return self._fallback_response()
+                if (
+                    not isinstance(rewritten_question, str)
+                    or not rewritten_question.strip()
+                    or self._same_query(original_question, rewritten_question)
+                ):
+                    logger.warning("Self-RAG relevance retry failed; returning fallback")
+                    return self._fallback_response()
+
+                logger.info("Self-RAG query rewrite completed; retry_count=1")
+                evidence = self._retrieve_and_prepare(rewritten_question.strip())
+                if not evidence:
+                    logger.warning("Self-RAG relevance retry failed; returning fallback")
+                    return self._fallback_response()
+                context = self._context_for_evidence(evidence)
+                relevance_action = self._check_relevance(original_question, context)
+                if relevance_action is None or relevance_action is RAGAction.FALLBACK:
+                    if relevance_action is RAGAction.FALLBACK:
+                        logger.warning("Self-RAG checker unavailable; returning fallback")
+                    return self._fallback_response()
+                if relevance_action is not RAGAction.ACCEPT:
+                    logger.warning("Self-RAG relevance retry failed; returning fallback")
+                    return self._fallback_response()
+        else:
+            context = self._context_for_evidence(evidence)
+
+        generate = answer_generator or self._generate_answer
+        answer = self._clean_answer(
+            generate(
+                original_question,
+                session_history,
+                evidence,
+                corrective=False,
+            )
+        )
+
+        if self.self_rag is not None:
+            faithfulness_action = self._check_faithfulness(
+                original_question,
+                answer,
+                context,
+            )
+            if faithfulness_action is None or faithfulness_action is RAGAction.FALLBACK:
+                if faithfulness_action is RAGAction.FALLBACK:
+                    logger.warning("Self-RAG checker unavailable; returning fallback")
+                return self._fallback_response()
+            if faithfulness_action is RAGAction.RETRY:
+                if self.max_faithfulness_retries == 0:
+                    logger.warning("Self-RAG faithfulness retry failed; returning fallback")
+                    return self._fallback_response()
+                logger.info(
+                    "Self-RAG faithfulness check failed; regenerating answer; retry_count=1"
+                )
+                answer = self._clean_answer(
+                    generate(
+                        original_question,
+                        session_history,
+                        evidence,
+                        corrective=True,
+                    )
+                )
+                faithfulness_action = self._check_faithfulness(
+                    original_question,
+                    answer,
+                    context,
+                )
+                if faithfulness_action is None or faithfulness_action is RAGAction.FALLBACK:
+                    if faithfulness_action is RAGAction.FALLBACK:
+                        logger.warning("Self-RAG checker unavailable; returning fallback")
+                    return self._fallback_response()
+                if faithfulness_action is not RAGAction.ACCEPT:
+                    logger.warning("Self-RAG faithfulness retry failed; returning fallback")
+                    return self._fallback_response()
+
+        _system_prompt, _messages, citations = self._generation_inputs(
+            original_question,
+            session_history,
+            evidence,
+        )
+        return RAGResponse(answer, citations, "general")
+
     def answer_stream(self, question: str, session_history: Optional[List[dict]] = None) -> Any:
+        if self.self_rag is not None:
+            response = self._run_grounded_pipeline(
+                question,
+                session_history,
+                answer_generator=self._generate_buffered_stream_answer,
+            )
+            yield {
+                "type": "metadata",
+                "citations": response.citations,
+                "route_type": response.route_type,
+            }
+            yield {"type": "chunk", "text": response.answer}
+            return
+
         if not question or not question.strip():
             yield {"type": "metadata", "citations": [], "route_type": "out_of_scope"}
             yield {"type": "chunk", "text": FALLBACK_ANSWER}
@@ -299,20 +543,4 @@ class RAGChain:
                 yield {"type": "chunk", "text": accumulator}
 
     def answer(self, question: str, session_history: Optional[List[dict]] = None) -> RAGResponse:
-        if not question or not question.strip():
-            return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
-
-        evidence = self._retrieve_and_prepare(question)
-        if not evidence:
-            return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
-
-        system_prompt, messages, citations = self._generation_inputs(
-            question, session_history, evidence
-        )
-        answer = self._clean_answer(
-            self.llm_client.generate(system_prompt=system_prompt, messages=messages)
-        )
-
-        # Keep a one-to-one mapping with the numbered context documents so an
-        # answer marker [n] always points to citations[n - 1] in the API payload.
-        return RAGResponse(answer, citations, "general")
+        return self._run_grounded_pipeline(question, session_history)
