@@ -1,0 +1,266 @@
+[
+  {
+    "id": "tuition-standard-2026",
+    "query_type": "factual",
+    "question": "Học phí chương trình đại trà của PTIT năm học 2026-2027 dự kiến là bao nhiêu?",
+    "expected_answer": "Học phí chương trình đại trà dự kiến trung bình từ khoảng 35,9 đến 40,7 triệu đồng mỗi năm, tùy ngành hoặc chương trình.",
+    "expected_facts": ["35,9", "40,7 triệu đồng"],
+    "expected_sources": [{"doc_id": "ptit-2026-tuition-thong-tin-tuyen-sinh-dai-hoc-chinh-quy-nam-2026-hoc-phi-v1"}]
+  },
+  {
+    "id": "tuition-high-quality-2026",
+    "query_type": "factual",
+    "question": "Học phí chương trình chất lượng cao PTIT năm học 2026-2027 trong khoảng nào?",
+    "expected_answer": "Mức học phí trung bình của chương trình chất lượng cao dự kiến từ khoảng 44,8 đến 58,3 triệu đồng mỗi năm.",
+    "expected_facts": ["44,8", "58,3 triệu đồng"],
+    "expected_sources": [{"doc_id": "ptit-2026-tuition-thong-tin-tuyen-sinh-dai-hoc-chinh-quy-nam-2026-hoc-phi-v1"}]
+  },
+  {
+    "id": "tuition-special-programs-2026",
+    "query_type": "factual",
+    "question": "Học phí các chương trình CNTT định hướng ứng dụng, Game, CNTT Việt-Nhật và AI của PTIT năm 2026-2027 là bao nhiêu?",
+    "expected_answer": "Các chương trình này có mức học phí trung bình dự kiến từ khoảng 41,3 đến 46,7 triệu đồng mỗi năm.",
+    "expected_facts": ["41,3", "46,7 triệu đồng"],
+    "expected_sources": [{"doc_id": "ptit-2026-tuition-thong-tin-tuyen-sinh-dai-hoc-chinh-quy-nam-2026-hoc-phi-v1"}]
+  },
+  {
+    "id": "tuition-international-2026",
+    "query_type": "factual",
+    "question": "Chương trình liên kết quốc tế của PTIT năm học 2026-2027 có học phí dự kiến bao nhiêu?",
+    "expected_answer": "Học phí trung bình dự kiến của chương trình liên kết quốc tế từ khoảng 58,3 đến 67,2 triệu đồng mỗi năm, tùy chương trình.",
+    "expected_facts": ["58,3", "67,2 triệu đồng"],
+    "expected_sources": [{"doc_id": "ptit-2026-tuition-thong-tin-tuyen-sinh-dai-hoc-chinh-quy-nam-2026-hoc-phi-v1"}]
+  },
+  {
+    "id": "tuition-increase-policy-2026",
+    "query_type": "factual",
+    "question": "Lộ trình tăng học phí của PTIT áp dụng theo văn bản nào?",
+    "expected_answer": "Lộ trình tăng học phí từng năm thực hiện theo Nghị định số 238/NĐ-CP ngày 03/9/2025 của Chính phủ.",
+    "expected_facts": ["238/NĐ-CP", "03/9/2025"],
+    "expected_sources": [{"doc_id": "ptit-2026-tuition-thong-tin-tuyen-sinh-dai-hoc-chinh-quy-nam-2026-hoc-phi-v1"}]
+  },
+  {
+    "id": "scholarship-special-slots",
+    "query_type": "factual",
+    "question": "PTIT cấp tối đa bao nhiêu suất học bổng đặc biệt trong năm 2026?",
+    "expected_answer": "Năm 2026, PTIT cấp tối đa 30 suất học bổng đặc biệt.",
+    "expected_facts": ["30 suất"],
+    "expected_sources": [{"doc_id": "ptit-2026-scholarships-chinh-sach-hoc-bong-v1"}]
+  },
+  {
+    "id": "scholarship-special-value",
+    "query_type": "factual",
+    "question": "Một suất học bổng đặc biệt của PTIT năm 2026 có giá trị tối đa bao nhiêu?",
+    "expected_answer": "Mỗi suất học bổng đặc biệt có giá trị tới 500 triệu đồng.",
+    "expected_facts": ["500 triệu đồng"],
+    "expected_sources": [{"doc_id": "ptit-2026-scholarships-chinh-sach-hoc-bong-v1"}]
+  },
+  {
+    "id": "scholarship-special-thpt-threshold",
+    "query_type": "factual",
+    "question": "Thí sinh cần bao nhiêu điểm thi tốt nghiệp THPT để thuộc diện xét học bổng đặc biệt PTIT 2026?",
+    "expected_answer": "Một diện xét học bổng đặc biệt là thí sinh đạt từ 29,0 điểm thi tốt nghiệp THPT, không gồm điểm cộng và điểm ưu tiên.",
+    "expected_facts": ["29,0 điểm", "không bao gồm điểm cộng và điểm ưu tiên"],
+    "expected_sources": [{"doc_id": "ptit-2026-scholarships-chinh-sach-hoc-bong-v1"}]
+  },
+  {
+    "id": "scholarship-full-slots-value",
+    "query_type": "factual",
+    "question": "Học bổng toàn phần PTIT năm 2026 có bao nhiêu suất và giá trị tối đa thế nào?",
+    "expected_answer": "PTIT cấp tối đa 50 suất học bổng toàn phần, mỗi suất trị giá tới 250 triệu đồng.",
+    "expected_facts": ["50 suất", "250 triệu đồng"],
+    "expected_sources": [{"doc_id": "ptit-2026-scholarships-chinh-sach-hoc-bong-v1"}]
+  },
+  {
+    "id": "scholarship-full-thpt-threshold",
+    "query_type": "factual",
+    "question": "Ngưỡng điểm thi tốt nghiệp THPT để xét học bổng toàn phần PTIT 2026 là bao nhiêu?",
+    "expected_answer": "Ngưỡng điểm thuộc diện xét học bổng toàn phần là từ 28,5 điểm, không gồm điểm cộng và điểm ưu tiên.",
+    "expected_facts": ["28,5 điểm", "không bao gồm điểm cộng và điểm ưu tiên"],
+    "expected_sources": [{"doc_id": "ptit-2026-scholarships-chinh-sach-hoc-bong-v1"}]
+  },
+  {
+    "id": "scholarship-half-slots-value",
+    "query_type": "factual",
+    "question": "Học bổng bán phần PTIT 2026 có số suất và giá trị tối đa bao nhiêu?",
+    "expected_answer": "PTIT cấp tối đa 50 suất học bổng bán phần, giá trị mỗi suất tới 100 triệu đồng.",
+    "expected_facts": ["50 suất", "100 triệu đồng"],
+    "expected_sources": [{"doc_id": "ptit-2026-scholarships-chinh-sach-hoc-bong-v1"}]
+  },
+  {
+    "id": "scholarship-half-thpt-threshold",
+    "query_type": "factual",
+    "question": "Thí sinh đạt bao nhiêu điểm thi tốt nghiệp THPT thì thuộc diện xét học bổng bán phần PTIT 2026?",
+    "expected_answer": "Ngưỡng điểm thuộc diện xét học bổng bán phần là từ 28,0 điểm, không gồm điểm cộng và điểm ưu tiên.",
+    "expected_facts": ["28,0 điểm", "không bao gồm điểm cộng và điểm ưu tiên"],
+    "expected_sources": [{"doc_id": "ptit-2026-scholarships-chinh-sach-hoc-bong-v1"}]
+  },
+  {
+    "id": "scholarship-first-year-100",
+    "query_type": "factual",
+    "question": "PTIT có tối đa bao nhiêu suất miễn 100% học phí năm thứ nhất trong năm 2026?",
+    "expected_answer": "Chính sách năm 2026 có tối đa 100 suất miễn 100% học phí trong năm học thứ nhất.",
+    "expected_facts": ["100 suất", "100% học phí", "năm học thứ nhất"],
+    "expected_sources": [{"doc_id": "ptit-2026-scholarships-chinh-sach-hoc-bong-v1"}]
+  },
+  {
+    "id": "scholarship-one-type-only",
+    "query_type": "policy",
+    "question": "Một thí sinh có thể nhận đồng thời nhiều loại học bổng trong chính sách học bổng PTIT không?",
+    "expected_answer": "Không. Thí sinh chỉ được xét và cấp một loại học bổng trong chính sách này.",
+    "expected_facts": ["chỉ được xét và cấp một loại học bổng"],
+    "expected_sources": [{"doc_id": "ptit-2026-scholarships-chinh-sach-hoc-bong-v1"}]
+  },
+  {
+    "id": "program-it-code-quota",
+    "query_type": "factual",
+    "question": "Ngành Công nghệ thông tin PTIT năm 2026 có mã ngành và chỉ tiêu bao nhiêu?",
+    "expected_answer": "Ngành Công nghệ thông tin có mã 7480201 và 600 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7480201", "600 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-ky-thuat-cong-nghe-v1"}]
+  },
+  {
+    "id": "program-security-code-quota",
+    "query_type": "factual",
+    "question": "Mã ngành và chỉ tiêu ngành An toàn thông tin PTIT năm 2026 là gì?",
+    "expected_answer": "Ngành An toàn thông tin có mã 7480202 và 200 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7480202", "200 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-ky-thuat-cong-nghe-v1"}]
+  },
+  {
+    "id": "program-data-engineering-code-quota",
+    "query_type": "factual",
+    "question": "Chương trình Kỹ thuật dữ liệu thuộc ngành Mạng máy tính và truyền thông dữ liệu có mã và chỉ tiêu 2026 thế nào?",
+    "expected_answer": "Chương trình có mã ngành 7480102 và 135 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7480102", "135 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-ky-thuat-cong-nghe-v1"}]
+  },
+  {
+    "id": "program-ai-code-quota",
+    "query_type": "factual",
+    "question": "Ngành Trí tuệ nhân tạo PTIT năm 2026 có mã ngành và chỉ tiêu bao nhiêu?",
+    "expected_answer": "Ngành Trí tuệ nhân tạo có mã 7480107 và 160 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7480107", "160 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-ky-thuat-cong-nghe-v1"}]
+  },
+  {
+    "id": "program-computer-science-code-quota",
+    "query_type": "factual",
+    "question": "Ngành Khoa học máy tính định hướng Khoa học dữ liệu của PTIT có mã và chỉ tiêu 2026 bao nhiêu?",
+    "expected_answer": "Ngành có mã 7480101 và 160 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7480101", "160 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-ky-thuat-cong-nghe-v1"}]
+  },
+  {
+    "id": "program-electronics-quota",
+    "query_type": "factual",
+    "question": "Ngành Kỹ thuật Điện tử viễn thông PTIT tuyển bao nhiêu chỉ tiêu năm 2026?",
+    "expected_answer": "Ngành Kỹ thuật Điện tử viễn thông có 410 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["410 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-ky-thuat-cong-nghe-v1"}]
+  },
+  {
+    "id": "program-accounting-code-quota",
+    "query_type": "factual",
+    "question": "Ngành Kế toán PTIT năm 2026 có mã ngành và chỉ tiêu bao nhiêu?",
+    "expected_answer": "Ngành Kế toán có mã 7340301 và 200 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7340301", "200 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-kinh-te-kinh-doanh-va-quan-ly-v1"}]
+  },
+  {
+    "id": "program-marketing-code-quota",
+    "query_type": "factual",
+    "question": "Ngành Marketing PTIT năm 2026 có mã ngành và chỉ tiêu bao nhiêu?",
+    "expected_answer": "Ngành Marketing có mã 7340115 và 240 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7340115", "240 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-kinh-te-kinh-doanh-va-quan-ly-v1"}]
+  },
+  {
+    "id": "program-fintech-code-quota",
+    "query_type": "factual",
+    "question": "Ngành Công nghệ tài chính Fintech PTIT có mã và chỉ tiêu tuyển sinh 2026 là bao nhiêu?",
+    "expected_answer": "Ngành Công nghệ tài chính Fintech có mã 7340205 và 160 chỉ tiêu năm 2026.",
+    "expected_facts": ["7340205", "160 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-kinh-te-kinh-doanh-va-quan-ly-v1"}]
+  },
+  {
+    "id": "program-ecommerce-code-quota",
+    "query_type": "factual",
+    "question": "Ngành Thương mại điện tử PTIT năm 2026 có mã ngành và chỉ tiêu bao nhiêu?",
+    "expected_answer": "Ngành Thương mại điện tử có mã 7340122 và 180 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7340122", "180 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-kinh-te-kinh-doanh-va-quan-ly-v1"}]
+  },
+  {
+    "id": "program-multimedia-technology",
+    "query_type": "factual",
+    "question": "Ngành Công nghệ đa phương tiện PTIT có mã ngành và chỉ tiêu năm 2026 là gì?",
+    "expected_answer": "Ngành Công nghệ đa phương tiện có mã 7329001 và 260 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7329001", "260 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-bao-chi-truyen-thong-v1"}]
+  },
+  {
+    "id": "program-multimedia-communication",
+    "query_type": "factual",
+    "question": "Ngành Truyền thông đa phương tiện PTIT tuyển bao nhiêu chỉ tiêu năm 2026 và có mã gì?",
+    "expected_answer": "Ngành Truyền thông đa phương tiện có mã 7320104 và 120 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7320104", "120 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-bao-chi-truyen-thong-v1"}]
+  },
+  {
+    "id": "program-journalism",
+    "query_type": "factual",
+    "question": "Ngành Báo chí PTIT năm 2026 có mã ngành và chỉ tiêu bao nhiêu?",
+    "expected_answer": "Ngành Báo chí có mã 7320101 và 100 chỉ tiêu tuyển sinh năm 2026.",
+    "expected_facts": ["7320101", "100 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-bao-chi-truyen-thong-v1"}]
+  },
+  {
+    "id": "compare-it-security-quota",
+    "query_type": "comparative",
+    "question": "So sánh chỉ tiêu 2026 của ngành Công nghệ thông tin và An toàn thông tin tại PTIT.",
+    "expected_answer": "Công nghệ thông tin có 600 chỉ tiêu, còn An toàn thông tin có 200 chỉ tiêu; CNTT nhiều hơn 400 chỉ tiêu.",
+    "expected_facts": ["600 chỉ tiêu", "200 chỉ tiêu", "400 chỉ tiêu"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-ky-thuat-cong-nghe-v1"}]
+  },
+  {
+    "id": "broad-tech-programs",
+    "query_type": "broad_list",
+    "question": "Hãy nêu các ngành kỹ thuật, công nghệ chính PTIT công bố cho tuyển sinh 2026 cùng mã ngành.",
+    "expected_answer": "Danh sách gồm Công nghệ thông tin 7480201, An toàn thông tin 7480202, Kỹ thuật dữ liệu 7480102, Trí tuệ nhân tạo 7480107, Kỹ thuật Điện tử viễn thông 7520207, Công nghệ kỹ thuật Điện điện tử 7510301, Kỹ thuật Điều khiển và Tự động hoá 7520216 và Khoa học máy tính 7480101, cùng các chương trình kỹ thuật khác được công bố.",
+    "expected_facts": ["7480201", "7480202", "7480102", "7480107", "7520207", "7510301", "7520216", "7480101"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-ky-thuat-cong-nghe-v1"}]
+  },
+  {
+    "id": "broad-business-programs",
+    "query_type": "broad_list",
+    "question": "PTIT công bố những ngành kinh tế, kinh doanh và quản lý nào cho năm 2026?",
+    "expected_answer": "Các ngành và chương trình được công bố gồm Kế toán, Quản trị kinh doanh, Marketing, Phân tích dữ liệu trong tài chính kinh doanh, Logistics và Quản lý chuỗi cung ứng, Công nghệ tài chính Fintech, Thương mại điện tử, Quan hệ công chúng và các chương trình quản trị chuyên biệt.",
+    "expected_facts": ["Kế toán", "Quản trị kinh doanh", "Marketing", "Công nghệ tài chính", "Thương mại điện tử"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-kinh-te-kinh-doanh-va-quan-ly-v1"}]
+  },
+  {
+    "id": "broad-media-programs",
+    "query_type": "broad_list",
+    "question": "Nhóm ngành báo chí và truyền thông của PTIT năm 2026 gồm những ngành nào?",
+    "expected_answer": "Nhóm này gồm Công nghệ đa phương tiện, Công nghệ công nghiệp Văn hóa định hướng điện ảnh số, Thiết kế đồ họa Game, Truyền thông đa phương tiện và Báo chí; ngoài ra có chương trình Thạc sĩ Truyền thông đại chúng.",
+    "expected_facts": ["Công nghệ đa phương tiện", "Truyền thông đa phương tiện", "Báo chí"],
+    "expected_sources": [{"doc_id": "ptit-2026-programs-nhom-cac-nganh-chuong-trinh-dao-tao-linh-vuc-bao-chi-truyen-thong-v1"}]
+  },
+  {
+    "id": "out-of-scope-weather",
+    "query_type": "out_of_scope",
+    "question": "Ngày mai ở Đà Nẵng có mưa không?",
+    "expected_facts": [],
+    "expected_sources": [],
+    "expect_fallback": true
+  },
+  {
+    "id": "out-of-scope-cooking",
+    "query_type": "out_of_scope",
+    "question": "Hướng dẫn tôi nấu món phở bò tại nhà.",
+    "expected_facts": [],
+    "expected_sources": [],
+    "expect_fallback": true
+  }
+]

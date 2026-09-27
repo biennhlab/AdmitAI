@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "secret"
     JWT_EXPIRY_HOURS: int = 24
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/admitai.db"
+    CORS_ORIGINS: str = "http://localhost:3000"
     
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333

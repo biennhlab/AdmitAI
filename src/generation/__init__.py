@@ -2,7 +2,7 @@ from .llm_client import LLMClient
 from .prompts import SYSTEM_PROMPT, build_rag_prompt, format_citations
 from .self_rag import RAGAction, RAGCheckResult, RAGCheckStatus, SelfRAG
 from .session_memory import SessionMemory
-from .rag_chain import RAGChain, RAGResponse
+from .rag_chain import RAGChain, RAGEvaluationTrace, RAGResponse
 
 __all__ = [
     "LLMClient",
@@ -15,5 +15,6 @@ __all__ = [
     "SelfRAG",
     "SessionMemory",
     "RAGChain",
+    "RAGEvaluationTrace",
     "RAGResponse"
 ]

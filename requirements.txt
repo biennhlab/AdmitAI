@@ -29,7 +29,18 @@ qdrant-client==1.11.*
 rank-bm25==0.2.*
 
 # LLM
-openai==1.14.*
+openai==2.15.*
+
+# Evaluation
+# RAGAS 0.4.3 uses Instructor's OpenAI adapter; pin both to keep its API stable.
+instructor==1.14.3
+ragas==0.4.3
+# RAGAS 0.4.3 still imports LangChain's legacy VertexAI module. LangChain 1.x
+# removed it, so keep the compatible 0.3 API line for reproducible eval runs.
+langchain==0.3.27
+langchain-community==0.3.31
+langchain-core==0.3.79
+langchain-openai==0.3.35
 
 # Rate limiting
 slowapi==0.1.*

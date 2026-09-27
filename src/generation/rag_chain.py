@@ -40,6 +40,17 @@ class RAGResponse:
 
 
 @dataclass(frozen=True)
+class RAGEvaluationTrace:
+    """Diagnostic view of one production RAG execution for offline evaluation."""
+
+    question: str
+    answer: str
+    contexts: List[str]
+    citations: List[dict[str, Any]]
+    route_type: str
+
+
+@dataclass(frozen=True)
 class RankedEvidence:
     chunk: Any
     retrieval_score: float
@@ -364,7 +375,13 @@ class RAGChain:
         session_history: Optional[List[dict]] = None,
         *,
         answer_generator: Callable[..., str] | None = None,
+        trace_recorder: Callable[[list[str]], None] | None = None,
     ) -> RAGResponse:
+        # The recorder is local to one execution, keeping concurrent requests
+        # isolated. Fallbacks expose no context because no evidence supports the
+        # answer ultimately returned to the caller.
+        if trace_recorder is not None:
+            trace_recorder([])
         if not question or not question.strip():
             return self._fallback_response()
 
@@ -473,6 +490,10 @@ class RAGChain:
             session_history,
             evidence,
         )
+        if trace_recorder is not None:
+            trace_recorder(
+                [str(getattr(item.chunk, "content", "")) for item in evidence]
+            )
         return RAGResponse(answer, citations, "general")
 
     def answer_stream(self, question: str, session_history: Optional[List[dict]] = None) -> Any:
@@ -544,3 +565,27 @@ class RAGChain:
 
     def answer(self, question: str, session_history: Optional[List[dict]] = None) -> RAGResponse:
         return self._run_grounded_pipeline(question, session_history)
+
+    def evaluate_trace(
+        self,
+        question: str,
+        session_history: Optional[List[dict]] = None,
+    ) -> RAGEvaluationTrace:
+        """Run production logic once and return its exact generation evidence."""
+        contexts: list[str] = []
+
+        def record(values: list[str]) -> None:
+            contexts[:] = values
+
+        response = self._run_grounded_pipeline(
+            question,
+            session_history,
+            trace_recorder=record,
+        )
+        return RAGEvaluationTrace(
+            question=question,
+            answer=response.answer,
+            contexts=contexts,
+            citations=response.citations,
+            route_type=response.route_type,
+        )

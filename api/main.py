@@ -5,7 +5,6 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from qdrant_client import QdrantClient
 from sqlalchemy import text
 from slowapi.errors import RateLimitExceeded
@@ -40,7 +39,11 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in settings.CORS_ORIGINS.split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -290,9 +293,3 @@ async def health_check():
         and components["rag"]["ready"]
     )
     return {"status": "healthy" if all_ready else "degraded", "components": components}
-
-
-frontend_dir = Path(__file__).resolve().parents[1] / "frontend" / "chatbot"
-if frontend_dir.exists():
-    app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="chatbot")
-# Trigger reload
