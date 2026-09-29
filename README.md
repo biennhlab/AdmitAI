@@ -10,7 +10,7 @@ Frontend Next.js
   -> Backend FastAPI
   -> Truy xuất lai (Dense/Qdrant + BM25)
   -> Mở rộng ngữ cảnh
-  -> Xếp hạng lại bằng CrossEncoder
+  -> Xếp hạng lại (CrossEncoder local hoặc Hugging Face Endpoint)
   -> Self-RAG kiểm tra độ liên quan/tính trung thực
   -> LLM
   -> Câu trả lời bám sát nguồn + trích dẫn
@@ -89,7 +89,7 @@ Cấu hình `.env` phù hợp với môi trường triển khai. Tệp này ch�
 - **Cơ sở dữ liệu:** URL cơ sở dữ liệu SQLAlchemy; SQLite là lựa chọn mặc định khi chạy cục bộ.
 - **CORS:** danh sách origin trình duyệt được phép gọi trực tiếp FastAPI, phân tách bằng dấu phẩy.
 - **Qdrant:** host, port, collection và kích thước batch khi ingest dữ liệu.
-- **Embedding/xếp hạng lại:** định danh model embedding BGE và CrossEncoder.
+- **Embedding/xếp hạng lại:** embedding BGE local và backend reranker local/remote.
 - **Retrieval/RAG:** số lượng ứng viên, ngưỡng điểm, kích thước chunk và vị trí chỉ mục.
 
 Không commit `.env` hoặc thông tin xác thực thật. Trong môi trường production, đặt `CORS_ORIGINS` thành origin của frontend đã triển khai (hoặc nhiều origin phân tách bằng dấu phẩy), ví dụ:
@@ -97,6 +97,28 @@ Không commit `.env` hoặc thông tin xác thực thật. Trong môi trường 
 ```text
 CORS_ORIGINS=https://admissions.example.edu
 ```
+
+### Reranker backend
+
+Embedding vẫn chạy local với `EMBEDDING_MODEL=BAAI/bge-m3` ở cả hai chế độ.
+Môi trường phát triển tiếp tục dùng CrossEncoder local theo mặc định:
+
+```text
+RERANKER_BACKEND=local
+```
+
+Để dùng custom Hugging Face Endpoint trong production, cấu hình:
+
+```text
+RERANKER_BACKEND=remote
+RERANKER_REMOTE_URL=https://your-endpoint.example/rerank
+RERANKER_REMOTE_API_TOKEN=your_server_only_token
+```
+
+Token reranker chỉ được dùng ở server và không được đưa vào biến môi trường
+frontend. Khi endpoint remote timeout, trả HTTP error hoặc response sai schema,
+pipeline ghi log rồi tiếp tục theo retrieval order ban đầu; hệ thống không tự
+load local CrossEncoder làm fallback.
 
 ## Qdrant và ingest dữ liệu
 

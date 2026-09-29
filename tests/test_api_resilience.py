@@ -145,6 +145,13 @@ def test_initialize_rag_constructs_one_process_wide_reranker() -> None:
     reranker_factory.assert_called_once_with(
         model_name=chat.settings.RERANKER_MODEL,
         batch_size=chat.settings.RERANK_BATCH_SIZE,
+        backend=chat.settings.RERANKER_BACKEND,
+        remote_provider=chat.settings.RERANKER_REMOTE_PROVIDER,
+        remote_url=chat.settings.RERANKER_REMOTE_URL,
+        remote_api_token=chat.settings.RERANKER_REMOTE_API_TOKEN.get_secret_value(),
+        remote_timeout_seconds=chat.settings.RERANKER_REMOTE_TIMEOUT_SECONDS,
+        remote_max_retries=chat.settings.RERANKER_REMOTE_MAX_RETRIES,
+        remote_top_k_limit=chat.settings.RERANKER_REMOTE_TOP_K_LIMIT,
     )
     assert chat.rag_chain.reranker is reranker
     assert chat.rag_chain.self_rag.llm_client is llm
@@ -172,6 +179,10 @@ async def test_health_reports_each_ready_component_without_secrets():
     assert payload["components"]["local_index"]["ready"] is True
     assert payload["components"]["qdrant"]["ready"] is True
     assert payload["components"]["rag"]["ready"] is True
+    assert payload["components"]["rag"]["reranker"] == {
+        "backend": chat.settings.RERANKER_BACKEND,
+        "ready": True,
+    }
     assert payload["components"]["llm"] == {"configured": True}
     assert "api_key" not in str(payload).lower()
 

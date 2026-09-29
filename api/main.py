@@ -193,6 +193,12 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    chain = chat.rag_chain
+    reranker = getattr(chain, "reranker", None) if chain is not None else None
+    close_reranker = getattr(reranker, "close", None)
+    if callable(close_reranker):
+        await asyncio.to_thread(close_reranker)
+
     client = getattr(app.state, "qdrant_client", None)
     if client is not None:
         await asyncio.to_thread(client.close)

@@ -148,6 +148,13 @@ def initialize_rag(
         reranker = Reranker(
             model_name=settings.RERANKER_MODEL,
             batch_size=settings.RERANK_BATCH_SIZE,
+            backend=settings.RERANKER_BACKEND,
+            remote_provider=settings.RERANKER_REMOTE_PROVIDER,
+            remote_url=settings.RERANKER_REMOTE_URL,
+            remote_api_token=settings.RERANKER_REMOTE_API_TOKEN.get_secret_value(),
+            remote_timeout_seconds=settings.RERANKER_REMOTE_TIMEOUT_SECONDS,
+            remote_max_retries=settings.RERANKER_REMOTE_MAX_RETRIES,
+            remote_top_k_limit=settings.RERANKER_REMOTE_TOP_K_LIMIT,
         )
         self_rag = SelfRAG(llm_client)
         query_rewriter = QueryRewriter(llm_client)
@@ -208,6 +215,10 @@ def rag_status() -> dict[str, Any]:
         "documents": rag_manifest.get("document_count") if rag_manifest else 0,
         "chunks": rag_manifest.get("chunk_count") if rag_manifest else 0,
         "embedding_model": rag_manifest.get("embedding_model") if rag_manifest else None,
+        "reranker": {
+            "backend": settings.RERANKER_BACKEND,
+            "ready": rag_chain is not None,
+        },
     }
 
 
