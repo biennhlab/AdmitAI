@@ -6,6 +6,8 @@ import logging
 import re
 from typing import Any
 
+from .abbreviations import is_known_abbreviation
+
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +15,8 @@ _SYSTEM_PROMPT = """Bạn là bộ viết lại truy vấn cho hệ thống tìm
 Chỉ làm câu hỏi rõ ràng, đầy đủ và dễ tìm kiếm hơn; tuyệt đối không trả lời câu hỏi.
 Giữ nguyên ý định, mọi tên riêng, tên ngành, mã ngành, chữ viết tắt, con số, năm,
 cơ sở, chương trình và điều kiện có trong truy vấn. Không thêm dữ kiện mới.
+Các cặp chữ viết tắt và nghĩa đã xuất hiện trong truy vấn là dữ kiện cố định.
+Không thay đổi, thay thế hoặc diễn giải lại nghĩa của chúng.
 Chỉ trả về đúng một câu truy vấn đã viết lại, không giải thích và không dùng Markdown."""
 
 _USER_TEMPLATE = """Viết lại truy vấn nằm trong thẻ <query>.
@@ -35,7 +39,9 @@ def _protected_terms(text: str) -> set[str]:
     protected = {match.group(0).casefold() for match in _NUMBER_RE.finditer(text)}
     for token in _TOKEN_RE.findall(text):
         compact = re.sub(r"\W", "", token, flags=re.UNICODE)
-        if len(compact) >= 2 and any(char.isalpha() for char in compact) and compact.isupper():
+        if is_known_abbreviation(token):
+            protected.add(token.casefold())
+        elif len(compact) >= 2 and any(char.isalpha() for char in compact) and compact.isupper():
             protected.add(token.casefold())
         elif any(char.isalpha() for char in compact) and any(char.isdigit() for char in compact):
             protected.add(token.casefold())

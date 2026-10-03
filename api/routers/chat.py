@@ -26,6 +26,7 @@ from src.generation.llm_client import (
 )
 from src.generation.rag_chain import RAGChain, RAGRetrievalError
 from src.generation.session_memory import SessionMemory
+from src.query_transform import AbbreviationNormalizer, QueryRewriter
 from src.retrieval import Embedder, NaiveDenseSearch, load_dense_index
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,8 @@ def initialize_rag(
             # Dense cosine thresholds are not meaningful for RRF scores.
             min_score=None if is_injected else settings.RETRIEVAL_MIN_SCORE,
             min_lexical_coverage=settings.RETRIEVAL_MIN_LEXICAL_COVERAGE,
+            query_rewriter=QueryRewriter(llm_client),
+            abbreviation_normalizer=AbbreviationNormalizer(),
         )
         rag_manifest = loaded_manifest
         rag_initialization_error = None

@@ -2,6 +2,13 @@
 
 from .hyde import HyDE
 from .multi_query import MultiQuery
+from .abbreviations import ABBREVIATIONS, AbbreviationNormalizer
 from .rewriter import QueryRewriter
 
-__all__ = ["QueryRewriter", "HyDE", "MultiQuery"]
+__all__ = [
+    "ABBREVIATIONS",
+    "AbbreviationNormalizer",
+    "QueryRewriter",
+    "HyDE",
+    "MultiQuery",
+]

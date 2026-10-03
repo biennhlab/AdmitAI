@@ -5,6 +5,7 @@ import math
 import re
 from typing import Any, List, Optional
 
+from ..query_transform import AbbreviationNormalizer, QueryRewriter
 from .prompts import SYSTEM_PROMPT, build_rag_prompt, format_citations
 
 
@@ -32,12 +33,25 @@ class RAGChain:
         top_k: int = 5,
         min_score: float | None = None,
         min_lexical_coverage: float = 0.34,
+        query_rewriter: QueryRewriter | None = None,
+        abbreviation_normalizer: AbbreviationNormalizer | None = None,
     ):
         self.retriever = retriever
         self.llm_client = llm_client
         self.top_k = top_k
         self.min_score = min_score
         self.min_lexical_coverage = min_lexical_coverage
+        self.query_rewriter = query_rewriter
+        self.abbreviation_normalizer = (
+            abbreviation_normalizer or AbbreviationNormalizer()
+        )
+
+    def _retrieval_query(self, question: str) -> str:
+        """Normalize verified abbreviations, then optionally rewrite for search."""
+        normalized = self.abbreviation_normalizer.normalize(question)
+        if self.query_rewriter is None:
+            return normalized
+        return self.query_rewriter.rewrite(normalized)
 
     @staticmethod
     def _evidence_tokens(text: str) -> set[str]:
@@ -114,8 +128,9 @@ class RAGChain:
             yield {"type": "chunk", "text": FALLBACK_ANSWER}
             return
 
+        retrieval_query = self._retrieval_query(question)
         try:
-            retrieved = self.retriever.search(question, top_k=self.top_k)
+            retrieved = self.retriever.search(retrieval_query, top_k=self.top_k)
         except Exception as exc:
             raise RAGRetrievalError("Retrieval dependency failed") from exc
             
@@ -184,8 +199,9 @@ class RAGChain:
         if not question or not question.strip():
             return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
 
+        retrieval_query = self._retrieval_query(question)
         try:
-            retrieved = self.retriever.search(question, top_k=self.top_k)
+            retrieved = self.retriever.search(retrieval_query, top_k=self.top_k)
         except Exception as exc:
             raise RAGRetrievalError("Retrieval dependency failed") from exc
         if self.min_score is not None:
