@@ -1,4 +1,5 @@
 import logging
+import inspect
 from typing import Any, Dict, List, Iterator
 
 from openai import (
@@ -11,6 +12,8 @@ from openai import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MAX_OUTPUT_TOKENS = 1024
 
 
 class LLMProviderError(RuntimeError):
@@ -49,14 +52,40 @@ class LLMClient:
         base_url: str,
         timeout_seconds: float = 30.0,
         max_retries: int = 1,
+        reasoning_effort: str | None = None,
     ):
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.client = OpenAI(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout_seconds,
             max_retries=max_retries,
         )
+
+    @staticmethod
+    def _supports_keyword(callable_obj: Any, keyword: str) -> bool:
+        """Return whether an SDK callable accepts a keyword directly."""
+        try:
+            parameters = inspect.signature(callable_obj).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == keyword
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
+    def _reasoning_request_options(self) -> dict[str, Any]:
+        """Build reasoning options for both old and new OpenAI SDK releases."""
+        if not self.reasoning_effort:
+            return {}
+        create = self.client.chat.completions.create
+        if self._supports_keyword(create, "reasoning_effort"):
+            return {"reasoning_effort": self.reasoning_effort}
+        # openai 1.14 does not type this field yet, but extra_body forwards
+        # arbitrary OpenAI-compatible request fields to the provider.
+        return {"extra_body": {"reasoning_effort": self.reasoning_effort}}
 
     def generate(self, system_prompt: str, messages: List[Dict[str, str]], temperature: float = 0.3) -> str:
         """Generate a response using the provided system prompt and message history."""
@@ -68,7 +97,8 @@ class LLMClient:
                 model=self.model,
                 messages=formatted_messages,
                 temperature=temperature,
-                max_tokens=1024,
+                max_tokens=_MAX_OUTPUT_TOKENS,
+                **self._reasoning_request_options(),
             )
             return response.choices[0].message.content
         except AuthenticationError as exc:
@@ -100,8 +130,9 @@ class LLMClient:
                 model=self.model,
                 messages=formatted_messages,
                 temperature=temperature,
-                max_tokens=1024,
+                max_tokens=_MAX_OUTPUT_TOKENS,
                 stream=True,
+                **self._reasoning_request_options(),
             )
             for chunk in response:
                 content = chunk.choices[0].delta.content

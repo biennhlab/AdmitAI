@@ -43,6 +43,14 @@ LLM_UNAVAILABLE_MESSAGE = "Dịch vụ xử lý câu hỏi đang tạm thời ch
 INTERNAL_ERROR_MESSAGE = "Không thể xử lý yêu cầu lúc này."
 
 
+def _log_queued_exception(message: str, exc: Exception) -> None:
+    """Log an exception transported from the worker thread with its traceback."""
+    logger.error(
+        message,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+
+
 def _service_error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(
         status_code=status_code,
@@ -87,6 +95,12 @@ def initialize_rag(
             base_url=settings.LLM_BASE_URL,
             timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
             max_retries=settings.LLM_MAX_RETRIES,
+            reasoning_effort=(
+                "minimal"
+                if "generativelanguage.googleapis.com" in settings.LLM_BASE_URL
+                and settings.LLM_MODEL.casefold().startswith("gemma-4-")
+                else None
+            ),
         )
         rag_chain = RAGChain(
             retriever,
@@ -184,25 +198,25 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
             if isinstance(item, Exception):
                 exc = item
                 if isinstance(exc, LLMTimeoutError):
-                    logger.exception("Chat generation timed out")
+                    _log_queued_exception("Chat generation timed out", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_TIMEOUT_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, LLMAuthenticationError):
-                    logger.exception("Chat generation failed because provider authentication was rejected")
+                    _log_queued_exception("Chat generation failed because provider authentication was rejected", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, LLMRateLimitError):
-                    logger.exception("Chat generation was rate limited by the provider")
+                    _log_queued_exception("Chat generation was rate limited by the provider", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, LLMConnectionError):
-                    logger.exception("Chat generation could not reach the provider")
+                    _log_queued_exception("Chat generation could not reach the provider", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, LLMProviderError):
-                    logger.exception("Chat generation failed at the provider")
+                    _log_queued_exception("Chat generation failed at the provider", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, RAGRetrievalError):
-                    logger.exception("Chat generation dependency failed")
+                    _log_queued_exception("Chat generation dependency failed", exc)
                     yield f"event: error\ndata: {json.dumps({'code': 'RAG_UNAVAILABLE', 'message': RAG_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 else:
-                    logger.exception("Unexpected chat generation failure")
+                    _log_queued_exception("Unexpected chat generation failure", exc)
                     yield f"event: error\ndata: {json.dumps({'code': 'INTERNAL_ERROR', 'message': INTERNAL_ERROR_MESSAGE}, ensure_ascii=False)}\n\n"
                 return
                 
