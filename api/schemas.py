@@ -4,6 +4,7 @@ from datetime import datetime
 
 class Citation(BaseModel):
     source: str
+    marker: Optional[int] = None
     title: Optional[str] = None
     source_url: Optional[str] = None
     source_type: Optional[str] = None

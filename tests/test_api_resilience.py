@@ -309,3 +309,16 @@ def test_llm_client_classifies_openai_compatible_errors(sdk_error_type, domain_e
             timeout=2,
             max_retries=0,
         )
+
+
+def test_queued_exception_logging_preserves_traceback(caplog):
+    try:
+        raise TypeError("legacy SDK rejected a keyword")
+    except TypeError as exc:
+        queued_exception = exc
+
+    chat._log_queued_exception("Chat generation failed at the provider", queued_exception)
+
+    assert "Chat generation failed at the provider" in caplog.text
+    assert "TypeError: legacy SDK rejected a keyword" in caplog.text
+    assert "NoneType: None" not in caplog.text
