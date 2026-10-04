@@ -32,6 +32,10 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.local.example
+
+# Application helpers are source files, not Python package output.
+!/src/lib/
 
 # vercel
 .vercel

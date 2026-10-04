@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -28,6 +29,12 @@ def test_abbreviation_normalizer_expands_multiple_abbreviations():
         "so sánh CNTT (Công nghệ thông tin) "
         "và ATTT (An toàn thông tin)"
     )
+
+
+def test_clc_is_expanded_and_original_abbreviation_is_kept():
+    result = AbbreviationNormalizer().normalize("học phí CLC")
+
+    assert result == "học phí CLC (chất lượng cao)"
 
 
 @pytest.mark.parametrize(
@@ -76,6 +83,17 @@ def test_rewriter_returns_clearer_query_and_uses_existing_client_contract():
     assert kwargs["messages"][0]["role"] == "user"
 
 
+def test_rewriter_logs_the_rewritten_query(caplog):
+    llm = MagicMock()
+    rewritten = "Điểm chuẩn ngành CNTT của PTIT năm 2024 là bao nhiêu?"
+    llm.generate.return_value = rewritten
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        QueryRewriter(llm).rewrite("Điểm chuẩn CNTT PTIT 2024?")
+
+    assert f"Rewritten query: {rewritten}" in caplog.messages
+
+
 @pytest.mark.parametrize("output", ["", "   ", None])
 def test_rewriter_falls_back_on_empty_llm_output(output):
     llm = MagicMock()
@@ -98,6 +116,14 @@ def test_rewriter_rejects_changed_normalized_abbreviation_expansion():
 
     assert QueryRewriter(llm).rewrite(normalized) == normalized
     assert "dữ kiện cố định" in llm.generate.call_args.kwargs["system_prompt"]
+
+
+def test_rewriter_rejects_unjustified_new_abbreviation():
+    llm = MagicMock()
+    llm.generate.return_value = "Phương thức xét tuyển THPT năm 2025 là gì?"
+    original = "phương thức xét tuyển 2025"
+
+    assert QueryRewriter(llm).rewrite(original) == original
 
 
 @pytest.mark.parametrize(

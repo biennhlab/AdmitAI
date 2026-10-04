@@ -196,7 +196,9 @@ class HybridRetriever:
             metadata = chunk.metadata or {}
             parent_id = metadata.get("parent_chunk_id")
             
-            if parent_id and parent_id in self.parent_by_id:
+            # Table rows were deliberately removed from text parents during
+            # combined chunking. Hydrate text children while retaining tables.
+            if parent_id and parent_id in self.parent_by_id and metadata.get("chunk_type") != "table":
                 candidate_chunk = self.parent_by_id[parent_id]
             else:
                 candidate_chunk = chunk
@@ -234,6 +236,11 @@ class HybridRetriever:
         # We relax the strict top_k limit slightly to top_k * 3 for coverage_mode
         # to allow the ContextAssembler downstream to enforce character budgets exactly.
         max_results = top_k * 3 if coverage_mode else top_k
+
+        def expanded_chunk(c: Chunk, expansion_type: str) -> Chunk:
+            # Expansion labels belong to this search, not the shared corpus or
+            # another request's results.
+            return Chunk(c.chunk_id, c.content, {**(c.metadata or {}), "expansion_type": expansion_type})
         
         def add_candidate(c: Chunk, s: float) -> None:
             if c.chunk_id not in seen_chunk_ids and len(hydrated_results) < max_results:
@@ -247,15 +254,12 @@ class HybridRetriever:
                                 break
                             if part.chunk_id not in seen_chunk_ids:
                                 seen_chunk_ids.add(part.chunk_id)
-                                if part.metadata is None: part.metadata = {}
-                                part.metadata["expansion_type"] = "exact" if part.chunk_id == c.chunk_id else "table_sibling"
-                                hydrated_results.append((part, s - 1e-6))
+                                expansion_type = "exact" if part.chunk_id == c.chunk_id else "table_sibling"
+                                hydrated_results.append((expanded_chunk(part, expansion_type), s - 1e-6))
                         return
                 
                 seen_chunk_ids.add(c.chunk_id)
-                if c.metadata is None: c.metadata = {}
-                c.metadata["expansion_type"] = "exact"
-                hydrated_results.append((c, s))
+                hydrated_results.append((expanded_chunk(c, "exact"), s))
                 
                 if coverage_mode:
                     neighbors = self._get_neighbors(c, budget=2)
@@ -264,9 +268,7 @@ class HybridRetriever:
                             break
                         if n.chunk_id not in seen_chunk_ids:
                             seen_chunk_ids.add(n.chunk_id)
-                            if n.metadata is None: n.metadata = {}
-                            n.metadata["expansion_type"] = "neighbor"
-                            hydrated_results.append((n, s - 1e-5))
+                            hydrated_results.append((expanded_chunk(n, "neighbor"), s - 1e-5))
                             
         for c, s in round1:
             if len(hydrated_results) >= max_results:

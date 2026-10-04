@@ -25,7 +25,7 @@ class RAGResponse:
 
 @dataclass
 class _PromptChunk:
-    """Source-level context passed to the model with one stable citation marker."""
+    """Chunk context passed to the model with one stable citation marker."""
 
     chunk_id: str
     content: str
@@ -34,7 +34,7 @@ class _PromptChunk:
 
 @dataclass
 class _CitationSource:
-    """Retrieved chunks that resolve to the same original source."""
+    """Evidence for one retrieved chunk and its citation marker."""
 
     identity: str
     members: list[tuple[Any, float]]
@@ -133,13 +133,13 @@ class RAGChain:
         cls,
         question: str,
         retrieved: list[tuple[Any, float]],
-        limit: int = 2,
+        limit: int | None = None,
     ) -> list[_CitationSource]:
-        """Rank distinct sources by question support, using retrieval score only as a tie-breaker."""
+        """Rank chunks by question support, retaining a citation for each chunk."""
         query_tokens = cls._citation_tokens(question)
         grouped: dict[str, list[tuple[Any, float, int]]] = {}
         for position, (chunk, score) in enumerate(retrieved):
-            identity = cls._source_identity(chunk)
+            identity = f"{cls._source_identity(chunk)}:chunk:{getattr(chunk, 'chunk_id', position)}"
             grouped.setdefault(identity, []).append((chunk, float(score), position))
 
         ranked_groups: list[tuple[tuple[float, ...], str, list[tuple[Any, float, int]]]] = []
@@ -300,7 +300,7 @@ class RAGChain:
         }
         markers = sorted(valid_markers) if valid_markers else list(range(1, len(sources) + 1))
         citations: list[dict[str, Any]] = []
-        for marker in markers[:2]:
+        for marker in markers:
             source = sources[marker - 1]
             claim = cls._claim_for_marker(answer, marker)
             target_text = f"{claim}\n{question}"
@@ -440,18 +440,19 @@ class RAGChain:
                 started_streaming = True
             
             if started_streaming:
+                closing = close_pattern.search(accumulator)
+                if closing:
+                    emit = accumulator[:closing.start()]
+                    accumulator = ""
+                    if emit:
+                        answer_parts.append(emit)
+                        yield {"type": "chunk", "text": emit}
+                    break
                 if len(accumulator) > 30:
                     emit = accumulator[:-30]
                     accumulator = accumulator[-30:]
-                    if close_pattern.search(emit):
-                        emit = close_pattern.sub("", emit)
-                        if emit:
-                            answer_parts.append(emit)
-                            yield {"type": "chunk", "text": emit}
-                        break
-                    else:
-                        answer_parts.append(emit)
-                        yield {"type": "chunk", "text": emit}
+                    answer_parts.append(emit)
+                    yield {"type": "chunk", "text": emit}
                         
         if started_streaming and accumulator:
             accumulator = close_pattern.sub("", accumulator)

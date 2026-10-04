@@ -10,6 +10,7 @@ from .abbreviations import is_known_abbreviation
 
 
 logger = logging.getLogger(__name__)
+runtime_logger = logging.getLogger("uvicorn.error")
 
 _SYSTEM_PROMPT = """Bạn là bộ viết lại truy vấn cho hệ thống tìm kiếm tuyển sinh.
 Chỉ làm câu hỏi rõ ràng, đầy đủ và dễ tìm kiếm hơn; tuyệt đối không trả lời câu hỏi.
@@ -113,6 +114,7 @@ class QueryRewriter:
         ):
             logger.warning("Query rewrite dropped source terms; using the original query")
             return original
+        runtime_logger.info("Rewritten query: %s", rewritten)
         return rewritten
 
 

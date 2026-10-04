@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import asdict
+
 import pytest
 
-from src.ingestion.chunker import Chunk
+from src.ingestion.chunker import Chunk, combined_chunk
+from src.ingestion.parser import Heading, ParsedPage, Table
 from src.retrieval.fusion import HybridRetriever, reciprocal_rank_fusion
 
 
@@ -107,8 +111,8 @@ class StubRetriever:
 def test_hybrid_honors_top_k_calls_both_and_does_not_mutate_inputs() -> None:
     dense_results = [(chunk("dense"), 0.99), (chunk("shared"), 0.80), (chunk("d3"), 0.70)]
     sparse_results = [(chunk("sparse"), 12.0), (chunk("shared"), 8.0), (chunk("s3"), 2.0)]
-    dense_before = list(dense_results)
-    sparse_before = list(sparse_results)
+    dense_before = deepcopy(dense_results)
+    sparse_before = deepcopy(sparse_results)
     dense = StubRetriever(dense_results)
     sparse = StubRetriever(sparse_results)
 
@@ -133,7 +137,9 @@ def test_hybrid_keeps_chunk_and_fused_score_mapping_aligned() -> None:
     by_id = {item.chunk_id: (item, score) for item, score in results}
 
     assert ids(results) == ["shared", "z", "a"]
-    assert by_id["shared"][0] is dense_shared
+    assert by_id["shared"][0].content == dense_shared.content
+    assert by_id["shared"][0].metadata == {"expansion_type": "exact"}
+    assert dense_shared.metadata is None
     assert by_id["shared"][1] == pytest.approx(1 / 62 + 1 / 61)
     assert by_id["z"][1] == pytest.approx(1 / 61)
     assert by_id["a"][1] == pytest.approx(1 / 62)
@@ -147,7 +153,9 @@ def test_hybrid_handles_one_or_both_empty_branches_and_deduplicates_by_id() -> N
 
     results = HybridRetriever(dense, sparse).search("query", top_k=20)
     assert ids(results) == ["a", "b"]
-    assert results[0][0] is original
+    assert results[0][0].content == original.content
+    assert results[0][0].metadata == {"expansion_type": "exact"}
+    assert original.metadata is None
 
     assert HybridRetriever(StubRetriever([]), StubRetriever([])).search("query") == []
 
@@ -323,3 +331,57 @@ def test_hybrid_table_part_expansion_in_coverage_mode() -> None:
     # max_results = 2 * 3 = 6. All 4 chunks fit into the relaxed buffer.
     assert len(results_budget) == 4
     assert [r[0].chunk_id for r in results_budget] == ["t_part1", "t_part2", "t_part3", "normal"]
+
+
+@pytest.mark.parametrize("with_prose", [False, True])
+def test_combined_table_hits_keep_rows_and_expand_all_parts(with_prose: bool) -> None:
+    heading = Heading("Admission scores", 1, 1)
+    table = Table([["Major", "Score"], ["CNTT", "27.0"], ["ATTT", "26.5"], ["AI", "28.0"]], 1)
+    text = "Admission scores\n" + ("General admission information." if with_prose else "")
+    parents = []
+    chunks = combined_chunk(
+        [ParsedPage(1, text, tables=[table], headings=[heading])],
+        max_size=90,
+        metadata={"doc_id": "admission-doc"},
+        parent_chunks=parents,
+    )
+    table_parts = [item for item in chunks if item.metadata["chunk_type"] == "table"]
+    assert len(table_parts) > 1
+    selected = table_parts[-1]
+    dense = StubRetriever([(selected, 0.9)])
+    sparse = StubRetriever([])
+    sparse.chunks = chunks
+    corpus_before = deepcopy(chunks)
+    retriever = HybridRetriever(dense, sparse, parent_chunks=[asdict(parent) for parent in parents])
+
+    narrow = retriever.search("AI score", top_k=5)
+    assert ids(narrow) == [selected.chunk_id]
+    assert narrow[0][0].content == selected.content
+    assert "| AI | 28.0 |" in narrow[0][0].content
+    assert narrow[0][0].metadata["chunk_type"] == "table"
+
+    coverage = retriever.search("danh sách các ngành", top_k=5)
+    assert ids(coverage) == [part.chunk_id for part in table_parts]
+    assert [item.content for item, _score in coverage] == [part.content for part in table_parts]
+    assert chunks == corpus_before
+    assert narrow[0][0].metadata["expansion_type"] == "exact"
+
+
+def test_search_expansion_labels_do_not_mutate_corpus_or_previous_results() -> None:
+    first = chunk("first", metadata={"doc_id": "doc", "chunk_index": 0, "heading_path": ["heading"]})
+    second = chunk("second", metadata={"doc_id": "doc", "chunk_index": 1, "heading_path": ["heading"]})
+    dense = StubRetriever([(first, 1.0)])
+    sparse = StubRetriever([])
+    sparse.chunks = [first, second]
+    corpus_before = deepcopy(sparse.chunks)
+    retriever = HybridRetriever(dense, sparse)
+
+    coverage = retriever.search("danh sách các ngành", top_k=2)
+    coverage_before = deepcopy(coverage)
+    assert [item.metadata["expansion_type"] for item, _score in coverage] == ["exact", "neighbor"]
+    dense.results = [(second, 1.0)]
+    narrow = retriever.search("score", top_k=2)
+
+    assert narrow[0][0].metadata["expansion_type"] == "exact"
+    assert coverage == coverage_before
+    assert sparse.chunks == corpus_before

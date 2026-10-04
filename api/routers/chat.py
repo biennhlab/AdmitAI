@@ -252,10 +252,13 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
                 route_type=route_type_payload,
             ),
         ]
-        if is_new_session:
-            records.insert(0, ChatSession(id=session_id))
-        db.add_all(records)
         try:
+            if await db.get(ChatSession, session_id) is None:
+                db.add_all([ChatSession(id=session_id)])
+                # Flush the parent first: these models have no ORM relationship
+                # to order inserts automatically when foreign keys are enforced.
+                await db.flush()
+            db.add_all(records)
             await db.commit()
         except Exception:
             await db.rollback()
