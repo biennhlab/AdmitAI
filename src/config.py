@@ -1,4 +1,12 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
+
+
+DEFAULT_HUGGINGFACE_CACHE_DIR = str(
+    Path(__file__).resolve().parents[1] / "models" / "huggingface" / "hub"
+)
+
 
 class Settings(BaseSettings):
     LLM_API_KEY: str = "placeholder"
@@ -17,6 +25,7 @@ class Settings(BaseSettings):
     
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    HUGGINGFACE_CACHE_DIR: str = DEFAULT_HUGGINGFACE_CACHE_DIR
     
     RETRIEVAL_TOP_K: int = 20
     RETRIEVAL_CANDIDATE_MULTIPLIER: int = 3

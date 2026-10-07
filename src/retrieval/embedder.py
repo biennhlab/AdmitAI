@@ -37,12 +37,19 @@ class Embedder:
             if cached is not None:
                 return cached
             try:
-                model = SentenceTransformer(model_name, local_files_only=True)
+                model = SentenceTransformer(
+                    model_name,
+                    cache_folder=settings.HUGGINGFACE_CACHE_DIR,
+                    local_files_only=True,
+                )
             # Some transformers releases surface an incomplete local snapshot
             # as AttributeError rather than OSError. In that case, let the
             # normal Hugging Face resolution path repair/download the model.
             except (OSError, ValueError, AttributeError):
-                model = SentenceTransformer(model_name)
+                model = SentenceTransformer(
+                    model_name,
+                    cache_folder=settings.HUGGINGFACE_CACHE_DIR,
+                )
             cls._model_cache[cache_key] = model
             return model
 
