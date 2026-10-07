@@ -11,7 +11,7 @@
 - **Framework**: FastAPI (tự sinh OpenAPI/Swagger docs tại `/docs`)
 - **Base URL**: `http://localhost:8000/api`
 - **Auth**: JWT Bearer token cho admin endpoints; public cho chat endpoints
-- **Format**: JSON request/response
+- **Format**: JSON request/response; chat mặc định trả Server-Sent Events (SSE).
 - **Versioning**: `/api/v1/...` (khuyến nghị cho tương lai)
 
 ---
@@ -21,6 +21,12 @@
 ### 2.1 `POST /api/chat`
 
 Gửi câu hỏi và nhận câu trả lời từ chatbot.
+
+**Response negotiation**:
+- Không có `Accept`, `Accept: */*` hoặc `Accept: text/event-stream`: trả SSE.
+- `Accept: application/json`: trả JSON đầy đủ qua `ChatResponse`.
+- Nếu gửi cả hai media types, ưu tiên `q` cao hơn; bằng nhau giữ SSE.
+- Request body, citation schema và retrieval score không đổi giữa hai chế độ.
 
 **Request**:
 ```json
@@ -35,7 +41,7 @@ Gửi câu hỏi và nhận câu trả lời từ chatbot.
 | message | string | ✅ | Câu hỏi của thí sinh |
 | session_id | string (UUID) | ❌ | ID session, nếu null → tạo session mới |
 
-**Response** `200 OK`:
+**JSON response** `200 OK` (`Accept: application/json`):
 ```json
 {
   "answer": "Điểm chuẩn ngành Công nghệ thông tin (CNTT) năm 2024 là 27.0 điểm...",
@@ -46,7 +52,7 @@ Gửi câu hỏi và nhận câu trả lời từ chatbot.
       "snippet": "Ngành CNTT: Điểm chuẩn 27.0 (phương thức xét điểm thi THPT)"
     }
   ],
-  "route_type": "rag",
+  "route_type": "general",
   "session_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
@@ -58,8 +64,33 @@ Gửi câu hỏi và nhận câu trả lời từ chatbot.
 | citations[].source | string | Tên file nguồn |
 | citations[].page | integer | Trang trong PDF |
 | citations[].snippet | string | Đoạn trích dẫn gốc |
-| route_type | string | `rag` / `calculator` / `out_of_scope` |
+| route_type | string | RAGChain hiện trả `general` hoặc `out_of_scope` |
 | session_id | string | ID session (mới hoặc đã có) |
+
+**SSE response** `200 OK`, `Content-Type: text/event-stream`:
+
+```text
+data: {"type":"chunk","text":"Thông tin tuyển sinh [1]"}
+
+data: {"type":"metadata","session_id":"...","citations":[{"source":"Admission","marker":1,"chunk_id":"chunk-1","score":0.0123}],"route_type":"general"}
+
+```
+
+Mỗi event kết thúc bằng một dòng trống. Metadata có thể đến trước text khi
+không có evidence (`out_of_scope`); thứ tự citation và marker khớp context.
+`score` luôn là retrieval score, không phải reranker score.
+
+**Errors**:
+- Request thiếu/sai kiểu field: HTTP `422`; message rỗng: HTTP `400`.
+- RAG chưa sẵn sàng hoặc retrieval/reranking lỗi trước event đầu tiên: HTTP `503`.
+- LLM timeout: `504`; authentication/provider error: `502`; connection/rate limit: `503`.
+- Exception không dự kiến hoặc output dependency sai cấu trúc: `500`.
+- Trước event đầu tiên (và trong chế độ JSON), lỗi dùng JSON
+  `{"detail":{"code":"...","message":"..."}}`.
+- Sau khi SSE đã bắt đầu, HTTP status giữ `200`; phát `event: error` với JSON
+  `{"code":"...","message":"..."}` rồi kết thúc stream. Không lưu câu trả lời dở dang.
+- Lỗi lưu database được log/rollback nhưng không làm mất câu trả lời đã sinh.
+  Chi tiết exception nội bộ không được gửi cho client.
 
 **Response** `400 Bad Request`:
 ```json

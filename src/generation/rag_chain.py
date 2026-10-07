@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import math
+from numbers import Real
 import re
 from typing import Any, List, Optional
 
+from ..config import settings
 from ..query_transform import AbbreviationNormalizer, QueryRewriter
 from .prompts import SYSTEM_PROMPT, build_rag_prompt, format_citations
 
@@ -14,6 +17,10 @@ FALLBACK_ANSWER = "Mình chưa tìm thấy thông tin này trong dữ liệu tuy
 
 class RAGRetrievalError(RuntimeError):
     """The retrieval dependency failed while answering a request."""
+
+
+class RAGRerankingError(RAGRetrievalError):
+    """Reranking failed; generation must not proceed with unvalidated evidence."""
 
 
 @dataclass
@@ -54,6 +61,7 @@ class RAGChain:
         min_lexical_coverage: float = 0.34,
         query_rewriter: QueryRewriter | None = None,
         abbreviation_normalizer: AbbreviationNormalizer | None = None,
+        reranker: Any | None = None,
     ):
         self.retriever = retriever
         self.llm_client = llm_client
@@ -61,6 +69,7 @@ class RAGChain:
         self.min_score = min_score
         self.min_lexical_coverage = min_lexical_coverage
         self.query_rewriter = query_rewriter
+        self.reranker = reranker
         self.abbreviation_normalizer = (
             abbreviation_normalizer or AbbreviationNormalizer()
         )
@@ -71,6 +80,54 @@ class RAGChain:
         if self.query_rewriter is None:
             return normalized
         return self.query_rewriter.rewrite(normalized)
+
+    def _assemble_context(
+        self, query: str, retrieved: list[tuple[Any, float]]
+    ) -> list[tuple[Any, float]]:
+        from .assembler import ContextAssembler
+
+        if self.reranker is not None and retrieved:
+            try:
+                limit = settings.RERANK_TOP_K
+                reranked = self.reranker.rerank(query, retrieved, top_k=limit)
+                expected = min(len(retrieved), max(0, limit))
+                if not isinstance(reranked, list) or len(reranked) != expected:
+                    raise ValueError("Reranker returned an invalid result count")
+                # Validate membership with multiplicity: no invented chunks, changed
+                # retrieval scores, or repeated results absent from the input.
+                available = Counter((id(chunk), score) for chunk, score in retrieved)
+                previous_rank = None
+                for item in reranked:
+                    if not isinstance(item, tuple) or len(item) != 3:
+                        raise TypeError("Reranker results must be (chunk, retrieval_score, reranker_score)")
+                    chunk, retrieval_score, reranker_score = item
+                    if any(
+                        not isinstance(score, Real) or isinstance(score, bool)
+                        or not math.isfinite(score)
+                        for score in (retrieval_score, reranker_score)
+                    ):
+                        raise ValueError("Reranker returned an invalid score")
+                    key = (id(chunk), retrieval_score)
+                    if not available[key]:
+                        raise ValueError("Reranker returned a chunk or retrieval score absent from candidates")
+                    available[key] -= 1
+                    rank = (-reranker_score, -retrieval_score, chunk.chunk_id)
+                    if previous_rank is not None and rank < previous_rank:
+                        raise ValueError("Reranker returned results out of order")
+                    previous_rank = rank
+                retrieved = [(chunk, score) for chunk, score, _ in reranked]
+            except Exception as exc:
+                raise RAGRerankingError("Reranking dependency failed") from exc
+
+        assembled = ContextAssembler(max_chars=12000).assemble(retrieved)
+        if self.reranker is not None:
+            # Keep the assembler's deduplication, expansion priorities and budget
+            # decisions, but present surviving evidence in reranker order.
+            positions: dict[int, int] = {}
+            for index, (chunk, _) in enumerate(retrieved):
+                positions.setdefault(id(chunk), index)
+            assembled.sort(key=lambda item: positions[id(item[0])])
+        return assembled
 
     @staticmethod
     def _evidence_tokens(text: str) -> set[str]:
@@ -134,8 +191,10 @@ class RAGChain:
         question: str,
         retrieved: list[tuple[Any, float]],
         limit: int | None = None,
+        *,
+        preserve_order: bool = False,
     ) -> list[_CitationSource]:
-        """Rank chunks by question support, retaining a citation for each chunk."""
+        """Keep reranked order or rank by question support for legacy callers."""
         query_tokens = cls._citation_tokens(question)
         grouped: dict[str, list[tuple[Any, float, int]]] = {}
         for position, (chunk, score) in enumerate(retrieved):
@@ -168,6 +227,8 @@ class RAGChain:
                 best_score,
                 float(-first_position),
             )
+            if preserve_order:
+                rank = (float(-first_position),)
             ranked_groups.append((rank, identity, members))
 
         ranked_groups.sort(key=lambda item: item[0], reverse=True)
@@ -397,17 +458,16 @@ class RAGChain:
         if self.min_score is not None:
             retrieved = [(chunk, score) for chunk, score in retrieved if score >= self.min_score]
             
-        from .assembler import ContextAssembler
-        assembler = ContextAssembler(max_chars=12000)
-        final_retrieved = assembler.assemble(retrieved)
+        final_retrieved = self._assemble_context(retrieval_query, retrieved)
 
         if not final_retrieved or not self._has_lexical_evidence(question, final_retrieved):
             yield {"type": "metadata", "citations": [], "route_type": "out_of_scope"}
             yield {"type": "chunk", "text": FALLBACK_ANSWER}
             return
 
-        chunks = [chunk for chunk, _ in final_retrieved]
-        sources = self._select_citation_sources(question, final_retrieved)
+        sources = self._select_citation_sources(
+            question, final_retrieved, preserve_order=self.reranker is not None
+        )
         chunks = [source.prompt_chunk for source in sources]
         scores = [source.retrieval_score for source in sources]
         context = format_citations(chunks, scores)
@@ -475,14 +535,14 @@ class RAGChain:
         if self.min_score is not None:
             retrieved = [(chunk, score) for chunk, score in retrieved if score >= self.min_score]
             
-        from .assembler import ContextAssembler
-        assembler = ContextAssembler(max_chars=12000)
-        final_retrieved = assembler.assemble(retrieved)
+        final_retrieved = self._assemble_context(retrieval_query, retrieved)
 
         if not final_retrieved or not self._has_lexical_evidence(question, final_retrieved):
             return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
 
-        sources = self._select_citation_sources(question, final_retrieved)
+        sources = self._select_citation_sources(
+            question, final_retrieved, preserve_order=self.reranker is not None
+        )
         chunks = [source.prompt_chunk for source in sources]
         scores = [source.retrieval_score for source in sources]
         context = format_citations(chunks, scores)
@@ -496,7 +556,7 @@ class RAGChain:
             self.llm_client.generate(system_prompt=system_prompt, messages=messages)
         )
 
-        # Keep a one-to-one mapping with the numbered context documents so an
-        # answer marker [n] always points to citations[n - 1] in the API payload.
+        # The marker field maps each returned citation to its numbered document,
+        # including when the answer cites only a subset of the context.
         citations = self._citations_for_answer(sources, answer, question)
         return RAGResponse(answer, citations, "general")

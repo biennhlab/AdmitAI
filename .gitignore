@@ -231,4 +231,6 @@ data/raw/
 data/index/
 *.pyc
 
-docs/acquired_knowledge
+docs/acquired_knowledge  
+
+models

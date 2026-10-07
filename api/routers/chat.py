@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 import json
 import queue
 import threading
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +28,7 @@ from src.generation.rag_chain import RAGChain, RAGRetrievalError
 from src.generation.session_memory import SessionMemory
 from src.query_transform import AbbreviationNormalizer, QueryRewriter
 from src.retrieval import Embedder, NaiveDenseSearch, load_dense_index
+from src.retrieval.reranker import Reranker
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -57,6 +58,87 @@ def _service_error(status_code: int, code: str, message: str) -> HTTPException:
         status_code=status_code,
         detail={"code": code, "message": message},
     )
+
+
+def _generation_http_error(exc: Exception) -> HTTPException:
+    """Use the same public error classification before and during a stream."""
+    _log_queued_exception("Chat generation dependency failed", exc)
+    if isinstance(exc, LLMTimeoutError):
+        return _service_error(504, exc.code, LLM_TIMEOUT_MESSAGE)
+    if isinstance(exc, LLMAuthenticationError):
+        return _service_error(502, exc.code, LLM_UNAVAILABLE_MESSAGE)
+    if isinstance(exc, (LLMConnectionError, LLMRateLimitError)):
+        return _service_error(503, exc.code, LLM_UNAVAILABLE_MESSAGE)
+    if isinstance(exc, LLMProviderError):
+        return _service_error(502, exc.code, LLM_UNAVAILABLE_MESSAGE)
+    if isinstance(exc, RAGRetrievalError):
+        return _service_error(503, "RAG_UNAVAILABLE", RAG_UNAVAILABLE_MESSAGE)
+    return _service_error(500, "INTERNAL_ERROR", INTERNAL_ERROR_MESSAGE)
+
+
+def _wants_json(accept: str | None) -> bool:
+    """Opt into JSON explicitly; wildcards, no preference and ties retain SSE."""
+    preferences = {"application/json": 0.0, "text/event-stream": 0.0}
+    for entry in (accept or "").lower().split(","):
+        media_type, *parameters = [part.strip() for part in entry.split(";")]
+        if media_type not in preferences:
+            continue
+        quality = 1.0
+        for parameter in parameters:
+            key, separator, value = parameter.partition("=")
+            if separator and key.strip() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        if 0 <= quality <= 1:
+            preferences[media_type] = max(preferences[media_type], quality)
+    return preferences["application/json"] > preferences["text/event-stream"]
+
+
+def _stream_item(item: Any) -> dict[str, Any]:
+    """Validate the dependency boundary before sending data to the client."""
+    if not isinstance(item, dict):
+        raise TypeError("RAG stream events must be dictionaries")
+    if item.get("type") == "chunk" and isinstance(item.get("text"), str):
+        payload = {"type": "chunk", "text": item["text"]}
+    elif item.get("type") == "metadata":
+        if not isinstance(item.get("citations"), list) or not isinstance(item.get("route_type"), str):
+            raise TypeError("Invalid RAG stream metadata")
+        payload = {
+            "type": "metadata",
+            "citations": [Citation.model_validate(c).model_dump(exclude_unset=True) for c in item["citations"]],
+            "route_type": item["route_type"],
+        }
+    else:
+        raise TypeError("Invalid RAG stream event")
+    json.dumps(payload, allow_nan=False)
+    return payload
+
+
+async def _persist_answer(db: AsyncSession, session_id: str, question: str,
+                          answer: str, citations: list, route_type: str | None) -> None:
+    session_memory.add_message(session_id, "user", question)
+    session_memory.add_message(session_id, "assistant", answer)
+    records = [
+        ChatMessage(session_id=session_id, role="user", content=question),
+        ChatMessage(session_id=session_id, role="assistant", content=answer,
+                    citations=citations, route_type=route_type),
+    ]
+    try:
+        if await db.get(ChatSession, session_id) is None:
+            db.add_all([ChatSession(id=session_id)])
+            # Flush the parent first: these models have no ORM relationship
+            # to order inserts automatically when foreign keys are enforced.
+            await db.flush()
+        db.add_all(records)
+        await db.commit()
+    except Exception:
+        logger.exception("Could not persist chat messages")
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("Could not roll back chat messages")
 
 
 def initialize_rag(
@@ -112,6 +194,7 @@ def initialize_rag(
             min_lexical_coverage=settings.RETRIEVAL_MIN_LEXICAL_COVERAGE,
             query_rewriter=QueryRewriter(llm_client),
             abbreviation_normalizer=AbbreviationNormalizer(),
+            reranker=Reranker(),
         )
         rag_manifest = loaded_manifest
         rag_initialization_error = None
@@ -160,110 +243,86 @@ def rag_status() -> dict[str, Any]:
 
 
 @router.post("")
-async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
+async def chat(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    accept: Annotated[str | None, Header()] = None,
+):
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
-    if rag_chain is None:
-        raise _service_error(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "RAG_UNAVAILABLE",
-            rag_public_error or RAG_UNAVAILABLE_MESSAGE,
-        )
+    chain = rag_chain
+    if chain is None:
+        raise _service_error(503, "RAG_UNAVAILABLE", rag_public_error or RAG_UNAVAILABLE_MESSAGE)
 
     session_id = request.session_id
-    is_new_session = not session_id or session_id not in session_memory.sessions
-    if is_new_session:
+    if not session_id or session_id not in session_memory.sessions:
         session_id = session_memory.create_session()
-
     history_for_rag = session_memory.get_history(session_id, max_turns=5)
-    
+
+    if _wants_json(accept):
+        try:
+            result = await asyncio.to_thread(chain.answer, request.message, history_for_rag)
+            response = ChatResponse(
+                answer=result.answer, citations=result.citations,
+                route_type=result.route_type, session_id=session_id,
+            )
+            if not response.answer.strip():
+                raise ValueError("RAG returned an empty answer")
+            json.dumps(response.model_dump(), allow_nan=False)
+        except Exception as exc:
+            raise _generation_http_error(exc) from exc
+        await _persist_answer(db, session_id, request.message, response.answer,
+                              [c.model_dump() for c in response.citations], response.route_type)
+        return response
+
     q = queue.Queue()
-    
+
     def worker():
         try:
-            for item in rag_chain.answer_stream(request.message, history_for_rag):
-                q.put(item)
+            saw_text = False
+            saw_metadata = False
+            for item in chain.answer_stream(request.message, history_for_rag):
+                payload = _stream_item(item)
+                if payload["type"] == "chunk":
+                    saw_text |= bool(payload["text"].strip())
+                else:
+                    saw_metadata = True
+                q.put(payload)
+            if not saw_text or not saw_metadata:
+                raise ValueError("RAG stream ended without an answer or metadata")
             q.put(None)
-        except Exception as e:
-            q.put(e)
-            
+        except Exception as exc:
+            q.put(exc)
+
     threading.Thread(target=worker, daemon=True).start()
-    
+    # Do not commit HTTP 200 until the first valid event is available.
+    first_item = await asyncio.to_thread(q.get)
+    if isinstance(first_item, Exception):
+        raise _generation_http_error(first_item) from first_item
+
     async def async_generator():
         full_answer = ""
         citations_payload = []
         route_type_payload = "general"
-        
-        while True:
-            item = await asyncio.to_thread(q.get)
-            if item is None:
-                break
+        item = first_item
+        while item is not None:
             if isinstance(item, Exception):
-                exc = item
-                if isinstance(exc, LLMTimeoutError):
-                    _log_queued_exception("Chat generation timed out", exc)
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_TIMEOUT_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, LLMAuthenticationError):
-                    _log_queued_exception("Chat generation failed because provider authentication was rejected", exc)
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, LLMRateLimitError):
-                    _log_queued_exception("Chat generation was rate limited by the provider", exc)
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, LLMConnectionError):
-                    _log_queued_exception("Chat generation could not reach the provider", exc)
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, LLMProviderError):
-                    _log_queued_exception("Chat generation failed at the provider", exc)
-                    yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                elif isinstance(exc, RAGRetrievalError):
-                    _log_queued_exception("Chat generation dependency failed", exc)
-                    yield f"event: error\ndata: {json.dumps({'code': 'RAG_UNAVAILABLE', 'message': RAG_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
-                else:
-                    _log_queued_exception("Unexpected chat generation failure", exc)
-                    yield f"event: error\ndata: {json.dumps({'code': 'INTERNAL_ERROR', 'message': INTERNAL_ERROR_MESSAGE}, ensure_ascii=False)}\n\n"
+                error = _generation_http_error(item)
+                yield f"event: error\ndata: {json.dumps(error.detail, ensure_ascii=False)}\n\n"
                 return
-                
             if item["type"] == "metadata":
                 citations_payload = item["citations"]
                 route_type_payload = item["route_type"]
-                payload = {
-                    "type": "metadata",
-                    "session_id": session_id,
-                    "citations": citations_payload,
-                    "route_type": route_type_payload
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            elif item["type"] == "chunk":
-                chunk_text = item["text"]
-                full_answer += chunk_text
-                yield f"data: {json.dumps({'type': 'chunk', 'text': chunk_text}, ensure_ascii=False)}\n\n"
-                
-        # Save to database
-        session_memory.add_message(session_id, "user", request.message)
-        session_memory.add_message(session_id, "assistant", full_answer)
-        
-        records = [
-            ChatMessage(session_id=session_id, role="user", content=request.message),
-            ChatMessage(
-                session_id=session_id,
-                role="assistant",
-                content=full_answer,
-                citations=citations_payload,
-                route_type=route_type_payload,
-            ),
-        ]
-        try:
-            if await db.get(ChatSession, session_id) is None:
-                db.add_all([ChatSession(id=session_id)])
-                # Flush the parent first: these models have no ORM relationship
-                # to order inserts automatically when foreign keys are enforced.
-                await db.flush()
-            db.add_all(records)
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            logger.exception("Could not persist chat messages")
-            
+                payload = {**item, "session_id": session_id}
+            else:
+                full_answer += item["text"]
+                payload = item
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            item = await asyncio.to_thread(q.get)
+
+        await _persist_answer(db, session_id, request.message, full_answer,
+                              citations_payload, route_type_payload)
+
     return StreamingResponse(async_generator(), media_type="text/event-stream")
 
 
