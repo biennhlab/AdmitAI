@@ -26,6 +26,7 @@ from src.generation.llm_client import (
 )
 from src.generation.rag_chain import RAGChain, RAGRetrievalError
 from src.generation.session_memory import SessionMemory
+from src.query_transform import AbbreviationNormalizer, QueryRewriter
 from src.retrieval import Embedder, NaiveDenseSearch, load_dense_index
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,14 @@ RAG_UNAVAILABLE_MESSAGE = "Dịch vụ tư vấn đang tạm thời chưa sẵn 
 LLM_TIMEOUT_MESSAGE = "Yêu cầu xử lý mất nhiều thời gian hơn dự kiến."
 LLM_UNAVAILABLE_MESSAGE = "Dịch vụ xử lý câu hỏi đang tạm thời chưa sẵn sàng."
 INTERNAL_ERROR_MESSAGE = "Không thể xử lý yêu cầu lúc này."
+
+
+def _log_queued_exception(message: str, exc: Exception) -> None:
+    """Log an exception transported from the worker thread with its traceback."""
+    logger.error(
+        message,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
 
 
 def _service_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -87,6 +96,12 @@ def initialize_rag(
             base_url=settings.LLM_BASE_URL,
             timeout_seconds=settings.LLM_TIMEOUT_SECONDS,
             max_retries=settings.LLM_MAX_RETRIES,
+            reasoning_effort=(
+                "minimal"
+                if "generativelanguage.googleapis.com" in settings.LLM_BASE_URL
+                and settings.LLM_MODEL.casefold().startswith("gemma-4-")
+                else None
+            ),
         )
         rag_chain = RAGChain(
             retriever,
@@ -95,6 +110,8 @@ def initialize_rag(
             # Dense cosine thresholds are not meaningful for RRF scores.
             min_score=None if is_injected else settings.RETRIEVAL_MIN_SCORE,
             min_lexical_coverage=settings.RETRIEVAL_MIN_LEXICAL_COVERAGE,
+            query_rewriter=QueryRewriter(llm_client),
+            abbreviation_normalizer=AbbreviationNormalizer(),
         )
         rag_manifest = loaded_manifest
         rag_initialization_error = None
@@ -184,25 +201,25 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
             if isinstance(item, Exception):
                 exc = item
                 if isinstance(exc, LLMTimeoutError):
-                    logger.exception("Chat generation timed out")
+                    _log_queued_exception("Chat generation timed out", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_TIMEOUT_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, LLMAuthenticationError):
-                    logger.exception("Chat generation failed because provider authentication was rejected")
+                    _log_queued_exception("Chat generation failed because provider authentication was rejected", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, LLMRateLimitError):
-                    logger.exception("Chat generation was rate limited by the provider")
+                    _log_queued_exception("Chat generation was rate limited by the provider", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, LLMConnectionError):
-                    logger.exception("Chat generation could not reach the provider")
+                    _log_queued_exception("Chat generation could not reach the provider", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, LLMProviderError):
-                    logger.exception("Chat generation failed at the provider")
+                    _log_queued_exception("Chat generation failed at the provider", exc)
                     yield f"event: error\ndata: {json.dumps({'code': exc.code, 'message': LLM_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 elif isinstance(exc, RAGRetrievalError):
-                    logger.exception("Chat generation dependency failed")
+                    _log_queued_exception("Chat generation dependency failed", exc)
                     yield f"event: error\ndata: {json.dumps({'code': 'RAG_UNAVAILABLE', 'message': RAG_UNAVAILABLE_MESSAGE}, ensure_ascii=False)}\n\n"
                 else:
-                    logger.exception("Unexpected chat generation failure")
+                    _log_queued_exception("Unexpected chat generation failure", exc)
                     yield f"event: error\ndata: {json.dumps({'code': 'INTERNAL_ERROR', 'message': INTERNAL_ERROR_MESSAGE}, ensure_ascii=False)}\n\n"
                 return
                 
@@ -235,10 +252,13 @@ async def chat(request: ChatRequest, db: AsyncSession = Depends(get_db)):
                 route_type=route_type_payload,
             ),
         ]
-        if is_new_session:
-            records.insert(0, ChatSession(id=session_id))
-        db.add_all(records)
         try:
+            if await db.get(ChatSession, session_id) is None:
+                db.add_all([ChatSession(id=session_id)])
+                # Flush the parent first: these models have no ORM relationship
+                # to order inserts automatically when foreign keys are enforced.
+                await db.flush()
+            db.add_all(records)
             await db.commit()
         except Exception:
             await db.rollback()

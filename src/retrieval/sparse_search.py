@@ -100,4 +100,6 @@ class BM25Search:
         self.chunks = self._deduplicate(validated)
         self.tokenized_corpus = [tokenize(chunk_search_text(chunk)) for chunk in self.chunks]
         self._token_sets = [set(tokens) for tokens in self.tokenized_corpus]
-        self.bm25 = BM25Okapi(self.tokenized_corpus) if self.chunks else None
+        # Non-empty content can consist entirely of punctuation. rank_bm25
+        # divides by the vocabulary size when every document has zero tokens.
+        self.bm25 = BM25Okapi(self.tokenized_corpus) if any(self.tokenized_corpus) else None

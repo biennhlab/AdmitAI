@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 from src.ingestion.chunker import naive_chunk
 from src.ingestion.parser import parse_pdf
+from src.ingestion import combined_chunk, parse_markdown_document
 
 def test_naive_chunk_empty_text():
     chunks = naive_chunk("")
@@ -140,3 +141,24 @@ def test_parse_pdf_graceful_degradation():
         assert len(pages) == 1
         assert pages[0].text == "Content"
         assert len(pages[0].tables) == 0
+
+
+def test_markdown_escaped_pipes_preserve_cells_and_are_removed_from_text_chunks(tmp_path):
+    path = tmp_path / "table.md"
+    path.write_text(
+        "# Admission subjects\n\nChoose the subjects below.\n\n"
+        "| Major | Maths\\|Physics |\n| --- | --- |\n| CNTT | A\\|B |\n",
+        encoding="utf-8",
+    )
+
+    document = parse_markdown_document(path)
+
+    assert document.pages[0].tables[0].rows == [["Major", "Maths|Physics"], ["CNTT", "A|B"]]
+    chunks = combined_chunk(document.pages, metadata=document.metadata)
+    tables = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "table"]
+    children = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "child"]
+    assert len(tables) == 1
+    assert "| Major | Maths\\|Physics |" in tables[0].content
+    assert "| CNTT | A\\|B |" in tables[0].content
+    assert children
+    assert all("| CNTT |" not in chunk.content and "Maths\\|Physics" not in chunk.content for chunk in children)

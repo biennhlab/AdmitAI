@@ -109,3 +109,22 @@ def test_metadata_indexing_and_punctuation_normalization() -> None:
     
     # Should ignore punctuation
     assert tokenize("CNTT, An toàn!") == ["cntt", "an", "toàn"]
+
+
+@pytest.mark.parametrize("content", ["!!!", "---", "| |"])
+def test_tokenless_corpus_can_be_indexed_rebuilt_and_updated(content: str) -> None:
+    search = BM25Search()
+    tokenless = chunk("punctuation", content)
+    search.index([tokenless])
+
+    assert search.chunks == [tokenless]
+    assert search.search("admissions") == []
+    search.rebuild()
+    assert search.search("!!!") == []
+
+    searchable = chunk("words", "admissions subjects")
+    search.index([searchable])
+    assert [item.chunk_id for item, _score in search.search("subjects")] == ["words"]
+    search.index([chunk("words", "???")])
+    assert len(search.chunks) == 2
+    assert search.search("subjects") == []

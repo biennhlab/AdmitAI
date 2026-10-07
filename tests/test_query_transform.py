@@ -1,11 +1,59 @@
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
-from src.query_transform import HyDE, MultiQuery, QueryRewriter
+from src.query_transform import AbbreviationNormalizer, HyDE, MultiQuery, QueryRewriter
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("điểm chuẩn CNTT", "điểm chuẩn CNTT (Công nghệ thông tin)"),
+        ("điểm chuẩn cntt", "điểm chuẩn cntt (Công nghệ thông tin)"),
+        ("phương thức ĐGNL", "phương thức ĐGNL (đánh giá năng lực)"),
+        ("phương thức dgnl", "phương thức dgnl (đánh giá năng lực)"),
+    ],
+)
+def test_abbreviation_normalizer_expands_exact_tokens_case_insensitively(query, expected):
+    assert AbbreviationNormalizer().normalize(query) == expected
+
+
+def test_abbreviation_normalizer_expands_multiple_abbreviations():
+    result = AbbreviationNormalizer().normalize("so sánh CNTT và ATTT")
+
+    assert result == (
+        "so sánh CNTT (Công nghệ thông tin) "
+        "và ATTT (An toàn thông tin)"
+    )
+
+
+def test_clc_is_expanded_and_original_abbreviation_is_kept():
+    result = AbbreviationNormalizer().normalize("học phí CLC")
+
+    assert result == "học phí CLC (chất lượng cao)"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "học phí Công nghệ thông tin",
+        "điểm chuẩn XYZABC",
+        "từ acnttx không phải abbreviation",
+    ],
+)
+def test_abbreviation_normalizer_leaves_normal_unknown_and_substring_queries_unchanged(query):
+    assert AbbreviationNormalizer().normalize(query) == query
+
+
+def test_abbreviation_normalizer_is_idempotent():
+    normalizer = AbbreviationNormalizer()
+    once = normalizer.normalize("so sánh cntt và CLC")
+
+    assert normalizer.normalize(once) == once
 
 
 @pytest.mark.parametrize("query", ["", "   ", "\n\t"])
@@ -35,6 +83,17 @@ def test_rewriter_returns_clearer_query_and_uses_existing_client_contract():
     assert kwargs["messages"][0]["role"] == "user"
 
 
+def test_rewriter_logs_the_rewritten_query(caplog):
+    llm = MagicMock()
+    rewritten = "Điểm chuẩn ngành CNTT của PTIT năm 2024 là bao nhiêu?"
+    llm.generate.return_value = rewritten
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        QueryRewriter(llm).rewrite("Điểm chuẩn CNTT PTIT 2024?")
+
+    assert f"Rewritten query: {rewritten}" in caplog.messages
+
+
 @pytest.mark.parametrize("output", ["", "   ", None])
 def test_rewriter_falls_back_on_empty_llm_output(output):
     llm = MagicMock()
@@ -48,6 +107,23 @@ def test_rewriter_falls_back_on_llm_exception_or_timeout():
     llm.generate.side_effect = TimeoutError("provider timeout")
 
     assert QueryRewriter(llm).rewrite("Học phí PTIT?") == "Học phí PTIT?"
+
+
+def test_rewriter_rejects_changed_normalized_abbreviation_expansion():
+    llm = MagicMock()
+    llm.generate.return_value = "Điểm chuẩn CNTT (Công nghệ truyền thông) năm 2025?"
+    normalized = "Điểm chuẩn CNTT (Công nghệ thông tin) năm 2025?"
+
+    assert QueryRewriter(llm).rewrite(normalized) == normalized
+    assert "dữ kiện cố định" in llm.generate.call_args.kwargs["system_prompt"]
+
+
+def test_rewriter_rejects_unjustified_new_abbreviation():
+    llm = MagicMock()
+    llm.generate.return_value = "Phương thức xét tuyển THPT năm 2025 là gì?"
+    original = "phương thức xét tuyển 2025"
+
+    assert QueryRewriter(llm).rewrite(original) == original
 
 
 @pytest.mark.parametrize(

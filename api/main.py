@@ -24,6 +24,7 @@ from slowapi.util import get_remote_address
 
 limiter = Limiter(key_func=get_remote_address)
 logger = logging.getLogger(__name__)
+_rag_recovery_lock = asyncio.Lock()
 
 app = FastAPI(title="AdmitAI API")
 
@@ -225,29 +226,53 @@ async def health_check():
 
     qdrant_client = getattr(app.state, "qdrant_client", None)
     
-    # Auto-reconnect Qdrant and RAG if they failed during startup
-    if (not components["qdrant"]["ready"] or qdrant_client is None) and components["local_index"]["ready"]:
-        try:
-            chunks, manifest = await asyncio.to_thread(load_local_index)
-            client, retriever, _ = await asyncio.to_thread(
-                load_hybrid_retriever, chunks, manifest
-            )
-            app.state.qdrant_client = client
-            app.state.hybrid_retriever = retriever
-            qdrant_client = client
-            await asyncio.to_thread(
-                chat.initialize_rag, retriever=retriever, manifest=manifest
-            )
-            app.state.components["qdrant"] = {
-                "ready": True,
-                "collection": settings.QDRANT_COLLECTION,
-                "chunks": len(chunks),
-            }
+    # Auto-reconnect Qdrant and RAG if they failed during startup.
+    # Apply the same LLM configuration check used by startup before loading
+    # expensive retrieval resources or making the chat service available.
+    components["llm"]["configured"] = _llm_is_configured()
+    app.state.components["llm"]["configured"] = components["llm"]["configured"]
+    if (
+        (not components["qdrant"]["ready"] or qdrant_client is None)
+        and components["local_index"]["ready"]
+        and components["llm"]["configured"]
+    ):
+        async with _rag_recovery_lock:
+            # Another health request may have completed recovery while waiting.
+            qdrant_client = getattr(app.state, "qdrant_client", None)
+            if not app.state.components["qdrant"]["ready"] or qdrant_client is None:
+                candidate_client = None
+                try:
+                    chunks, manifest = await asyncio.to_thread(load_local_index)
+                    candidate_client, retriever, _ = await asyncio.to_thread(
+                        load_hybrid_retriever, chunks, manifest
+                    )
+                    await asyncio.to_thread(
+                        chat.initialize_rag, retriever=retriever, manifest=manifest
+                    )
+                    old_client = qdrant_client
+                    app.state.qdrant_client = candidate_client
+                    app.state.hybrid_retriever = retriever
+                    qdrant_client = candidate_client
+                    app.state.components["local_index"] = {
+                        "ready": True,
+                        "documents": int(manifest.get("document_count", 0)),
+                        "chunks": len(chunks),
+                        "embedding_model": manifest.get("embedding_model"),
+                    }
+                    app.state.components["qdrant"] = {
+                        "ready": True,
+                        "collection": settings.QDRANT_COLLECTION,
+                        "chunks": len(chunks),
+                    }
+                    candidate_client = None
+                    if old_client is not None and old_client is not qdrant_client:
+                        await asyncio.to_thread(old_client.close)
+                except Exception:
+                    if candidate_client is not None:
+                        await asyncio.to_thread(candidate_client.close)
+                    logger.exception("RAG recovery failed; API remains in degraded mode")
+            components["local_index"] = dict(app.state.components["local_index"])
             components["qdrant"] = dict(app.state.components["qdrant"])
-            components["llm"]["configured"] = _llm_is_configured()
-            app.state.components["llm"]["configured"] = components["llm"]["configured"]
-        except Exception:
-            pass
     if components["qdrant"]["ready"] and qdrant_client is not None:
         try:
             collection_exists = await asyncio.to_thread(

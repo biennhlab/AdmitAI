@@ -51,7 +51,7 @@ def _markdown_row(line: str) -> list[str] | None:
     stripped = line.strip()
     if not (stripped.startswith("|") and stripped.endswith("|")):
         return None
-    return [cell.replace("\\|", "|").strip() for cell in stripped[1:-1].split("|")]
+    return [cell.replace("\\|", "|").strip() for cell in re.split(r"(?<!\\)\|", stripped[1:-1])]
 
 
 def _is_markdown_separator(row: list[str]) -> bool:

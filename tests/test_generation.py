@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from src.generation.llm_client import LLMClient, LLMUpstreamError
 from src.generation.prompts import build_rag_prompt, format_citations, SYSTEM_PROMPT
@@ -29,11 +30,19 @@ def test_llm_client_generation():
         mock_response.choices[0].message.content = "This is a mock answer."
         mock_client_instance.chat.completions.create.return_value = mock_response
 
-        client = LLMClient(api_key="fake_key", model="fake-model", base_url="fake-url")
+        client = LLMClient(
+            api_key="fake_key",
+            model="fake-model",
+            base_url="fake-url",
+            reasoning_effort="minimal",
+        )
         answer = client.generate("system prompt", [{"role": "user", "content": "hello"}])
         
         assert answer == "This is a mock answer."
         mock_client_instance.chat.completions.create.assert_called_once()
+        generation_kwargs = mock_client_instance.chat.completions.create.call_args.kwargs
+        assert generation_kwargs["max_tokens"] == 1024
+        assert generation_kwargs["reasoning_effort"] == "minimal"
 
 def test_llm_client_error():
     with patch("src.generation.llm_client.OpenAI") as MockOpenAI:
@@ -44,6 +53,51 @@ def test_llm_client_error():
         client = LLMClient(api_key="fake", model="fake", base_url="fake-url")
         with pytest.raises(LLMUpstreamError, match="unexpected error"):
             client.generate("sys", [])
+
+
+def test_llm_client_legacy_sdk_forwards_reasoning_effort_through_extra_body():
+    captured = {}
+
+    class LegacyCompletions:
+        def create(
+            self,
+            *,
+            messages,
+            model,
+            temperature,
+            max_tokens,
+            stream=False,
+            extra_body=None,
+        ):
+            captured.update(
+                {
+                    "messages": messages,
+                    "model": model,
+                    "stream": stream,
+                    "extra_body": extra_body,
+                }
+            )
+            return [
+                SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="Xin chào"))]
+                )
+            ]
+
+    legacy_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=LegacyCompletions())
+    )
+    with patch("src.generation.llm_client.OpenAI", return_value=legacy_client):
+        client = LLMClient(
+            api_key="fake",
+            model="gemma-4-26b-a4b-it",
+            base_url="fake-url",
+            reasoning_effort="minimal",
+        )
+        chunks = list(client.generate_stream("system", [{"role": "user", "content": "hello"}]))
+
+    assert chunks == ["Xin chào"]
+    assert captured["stream"] is True
+    assert captured["extra_body"] == {"reasoning_effort": "minimal"}
 
 def test_build_rag_prompt_and_format_citations():
     chunk1 = MockChunk(1, "Text A", {"source": "doc1.pdf"})
@@ -80,9 +134,33 @@ def test_system_prompt_enforces_grounding_and_natural_markdown():
         "ngữ cảnh được cung cấp",
     ):
         assert internal_term in SYSTEM_PROMPT
+    assert "Trả lời trực tiếp vào điều người dùng hỏi ngay ở câu đầu tiên" in SYSTEM_PROMPT
+    assert "không lặp lại nguyên câu hỏi" in SYSTEM_PROMPT
+    assert "Trả lời bằng tiếng Việt tự nhiên" in SYSTEM_PROMPT
+    assert "Với câu hỏi đơn giản, ưu tiên 1–3 đoạn ngắn" in SYSTEM_PROMPT
+    assert "Chỉ dùng heading khi câu trả lời thật sự có từ hai phần nội dung khác nhau" in SYSTEM_PROMPT
+    assert "Không tạo heading chỉ để trang trí" in SYSTEM_PROMPT
+    assert "Dùng bullet hoặc numbered list khi có nhiều mục cần liệt kê" in SYSTEM_PROMPT
     assert "bảng Markdown" in SYSTEM_PROMPT
-    assert "Dùng bullet" in SYSTEM_PROMPT
     assert "**bold**" in SYSTEM_PROMPT
+    assert "có chọn lọc" in SYSTEM_PROMPT
+    assert "Chỉ dùng code block cho code hoặc dữ liệu kỹ thuật" in SYSTEM_PROMPT
+    assert "không đặt nội dung hội thoại thông thường trong code block" in SYSTEM_PROMPT
+    assert "Không dùng emoji mặc định" in SYSTEM_PROMPT
+    assert "Chỉ dùng tối đa một emoji" in SYSTEM_PROMPT
+    assert "dữ liệu tham khảo nội bộ" in SYSTEM_PROMPT
+    assert "Không được sao chép cấu trúc, tên trường, nhãn document hoặc metadata" in SYSTEM_PROMPT
+    assert "Chỉ xuất câu trả lời cuối cùng" in SYSTEM_PROMPT
+    assert "Không xuất suy luận nội bộ" in SYSTEM_PROMPT
+    assert "<thought>" in SYSTEM_PROMPT
+    assert "Không lặp lại hoặc tóm tắt câu hỏi" in SYSTEM_PROMPT
+    assert "Question:" in SYSTEM_PROMPT
+    assert "Role:" in SYSTEM_PROMPT
+    assert "Constraint:" in SYSTEM_PROMPT
+    assert "Document:" in SYSTEM_PROMPT
+    assert "Citation chỉ xuất dưới dạng marker [n]" in SYSTEM_PROMPT
+    assert SYSTEM_PROMPT.index("</response_style>") < SYSTEM_PROMPT.index("<output_contract>")
+    assert SYSTEM_PROMPT.index("</output_contract>") < SYSTEM_PROMPT.rindex("<retrieved_context>")
 
 
 @pytest.mark.parametrize(
@@ -116,6 +194,8 @@ def test_fallback_is_natural_and_non_technical():
     [
         ("<assistant_answer>\n### Ngành đào tạo\n- CNTT [1]\n</assistant_answer>", "### Ngành đào tạo\n- CNTT [1]"),
         ("<response>Thông tin tuyển sinh [1]</response>", "Thông tin tuyển sinh [1]"),
+        ("<thought>Phân tích nội bộ</thought>\n<final>Thông tin tuyển sinh [1]</final>", "Thông tin tuyển sinh [1]"),
+        ("<analysis>Phân tích chưa hoàn tất", ""),
         ("Nội dung <document> hợp lệ trong câu trả lời", "Nội dung <document> hợp lệ trong câu trả lời"),
     ],
 )
@@ -184,6 +264,26 @@ def test_rag_chain_answer_order():
     assert "file.pdf" not in call_kwargs["messages"][0]["content"]
 
 
+def test_rag_chain_stream_does_not_expose_model_thought_blocks():
+    chunks = [MockChunk(1, "Thông tin tuyển sinh", {"source": "file.pdf"})]
+    mock_llm = MagicMock()
+    mock_llm.generate_stream.return_value = iter(
+        [
+            "<thought>Phân tích ",
+            "nội bộ</thought><final>",
+            "Thông tin tuyển sinh [1]",
+            "</final>",
+        ]
+    )
+
+    events = list(RAGChain(MockRetriever(chunks), mock_llm).answer_stream("Thông tin tuyển sinh?"))
+    visible_answer = "".join(event["text"] for event in events if event["type"] == "chunk")
+
+    assert visible_answer == "Thông tin tuyển sinh [1]"
+    assert "Phân tích nội bộ" not in visible_answer
+    assert events[-1]["type"] == "metadata"
+
+
 def test_rag_chain_keeps_context_marker_and_citation_payload_in_the_same_order():
     chunks = [
         MockChunk(1, "Ngành thứ nhất", {"doc_id": "same-doc", "source": "file.pdf"}),
@@ -197,6 +297,53 @@ def test_rag_chain_keeps_context_marker_and_citation_payload_in_the_same_order()
     assert [citation["chunk_id"] for citation in response.citations] == ["1", "2"]
     system_prompt = mock_llm.generate.call_args.kwargs["system_prompt"]
     assert system_prompt.index('id="1"') < system_prompt.index('id="2"')
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_rag_chain_cites_each_chunk_from_the_same_document_without_a_two_source_limit(streaming):
+    chunks = [
+        MockChunk(index, f"Thông tin tuyển sinh ngành {index}", {"doc_id": "same-doc"})
+        for index in range(1, 5)
+    ]
+    llm = MagicMock()
+    answer = "Thông tin tuyển sinh [1] [2] [3] [4]"
+    llm.generate.return_value = answer
+    llm.generate_stream.return_value = iter([answer])
+    chain = RAGChain(MockRetriever(chunks), llm)
+
+    if streaming:
+        events = list(chain.answer_stream("Thông tin tuyển sinh"))
+        citations = events[-1]["citations"]
+        system_prompt = llm.generate_stream.call_args.kwargs["system_prompt"]
+    else:
+        response = chain.answer("Thông tin tuyển sinh")
+        citations = response.citations
+        system_prompt = llm.generate.call_args.kwargs["system_prompt"]
+
+    assert [citation["marker"] for citation in citations] == [1, 2, 3, 4]
+    assert [citation["chunk_id"] for citation in citations] == ["1", "2", "3", "4"]
+    for index in range(1, 5):
+        assert f'<document id="{index}"' in system_prompt
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 19, 31, 200])
+@pytest.mark.parametrize("wrapper", ["final", "assistant_answer"])
+def test_rag_chain_stream_strips_closing_wrapper_across_chunk_boundaries(chunk_size, wrapper):
+    chunks = [MockChunk(1, "Thông tin tuyển sinh", {"source": "file.pdf"})]
+    answer = "Thông tin tuyển sinh [1]. " * 8
+    provider_text = f"<{wrapper}>{answer}</{wrapper}>" + "nội dung ngoài câu trả lời " * 8
+    llm = MagicMock()
+    llm.generate_stream.return_value = iter(
+        provider_text[index:index + chunk_size]
+        for index in range(0, len(provider_text), chunk_size)
+    )
+
+    events = list(RAGChain(MockRetriever(chunks), llm).answer_stream("Thông tin tuyển sinh"))
+    visible = "".join(event["text"] for event in events if event["type"] == "chunk")
+
+    assert visible == answer
+    assert events[-1]["type"] == "metadata"
+    assert events[-1]["citations"][0]["marker"] == 1
+
 
 def test_rag_chain_empty_context():
     retriever = MockRetriever([])

@@ -5,7 +5,6 @@ import remarkGfm from 'remark-gfm';
 import {
   friendlyChatError,
   marksServiceUnavailable,
-  parseChatResponse,
   parseChatStream
 } from '@/lib/chatErrors.mjs';
 import styles from './FloatingChatbot.module.css';
@@ -96,6 +95,7 @@ export default function FloatingChatbot() {
     setMessages((prev) => [...prev, newUserMsg]);
     setInput('');
     setIsLoading(true);
+    const newBotMsgId = `bot-${newUserMsg.id}`;
 
     try {
       const payload = { message: text.trim() };
@@ -112,7 +112,6 @@ export default function FloatingChatbot() {
       });
       
       setServiceStatus('available');
-      const newBotMsgId = Date.now() + 1;
       
       setMessages((prev) => [...prev, {
         id: newBotMsgId,
@@ -141,13 +140,16 @@ export default function FloatingChatbot() {
         setServiceStatus('unavailable');
       }
       const errorMsg = {
-        id: Date.now() + 1,
+        id: `error-${newUserMsg.id}`,
         role: 'bot',
         content: friendlyChatError(error, isOnline),
         isError: true,
         citations: []
       };
-      setMessages((prev) => [...prev, errorMsg]);
+      setMessages((prev) => [
+        ...prev.filter(msg => msg.id !== newBotMsgId || msg.content.trim()),
+        errorMsg
+      ]);
     } finally {
       setIsLoading(false);
     }
@@ -234,10 +236,10 @@ export default function FloatingChatbot() {
                           <div key={i} className={styles.citationItem}>
                             {c.source_url ? (
                               <a href={c.source_url} target="_blank" rel="noopener noreferrer">
-                                [{i + 1}] {label}
+                                [{c.marker ?? i + 1}] {label}
                               </a>
                             ) : (
-                              <span>[{i + 1}] {label}</span>
+                              <span>[{c.marker ?? i + 1}] {label}</span>
                             )}
                             {location && <div className={styles.citationLocation}>{location}</div>}
                             {c.snippet && <div className={styles.citationSnippet}>{c.snippet}</div>}
