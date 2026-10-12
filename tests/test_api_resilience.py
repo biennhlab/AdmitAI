@@ -77,7 +77,14 @@ class FakeRAG:
 @pytest.fixture(autouse=True)
 def mock_reranker_model():
     # Health checks may initialize the real chain; keep model I/O out of API tests.
-    with patch("src.retrieval.reranker.CrossEncoder") as factory:
+    with (
+        patch("src.retrieval.reranker.CrossEncoder", autospec=True) as factory,
+        patch(
+            "src.retrieval.reranker.snapshot_download",
+            autospec=True,
+            return_value="D:/models/reranker/snapshot",
+        ),
+    ):
         factory.return_value.predict.side_effect = lambda pairs: [0.0] * len(pairs)
         yield factory
 

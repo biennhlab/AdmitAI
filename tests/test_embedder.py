@@ -2,8 +2,16 @@ import pytest
 import numpy as np
 from unittest.mock import patch, MagicMock
 
-from src.config import settings
+from src.config import Settings, settings
 from src.retrieval.embedder import Embedder
+
+
+def test_settings_reads_hf_token_from_environment(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf_from_environment")
+
+    loaded = Settings(_env_file=None)
+
+    assert loaded.HF_TOKEN == "hf_from_environment"
 
 @pytest.fixture
 def mock_sentence_transformer():
@@ -98,6 +106,29 @@ def test_model_is_reused_within_process(mock_sentence_transformer):
         cache_folder=settings.HUGGINGFACE_CACHE_DIR,
         local_files_only=True,
     )
+
+
+def test_remote_model_download_uses_configured_hf_token(mock_sentence_transformer, monkeypatch):
+    mock_sentence_transformer.side_effect = [OSError("not cached"), MagicMock()]
+    monkeypatch.setattr(settings, "HF_TOKEN", "  hf_test_token  ")
+
+    Embedder("authenticated-download-model")
+
+    assert mock_sentence_transformer.call_args_list[1].kwargs == {
+        "cache_folder": settings.HUGGINGFACE_CACHE_DIR,
+        "token": "hf_test_token",
+    }
+
+
+def test_remote_model_download_omits_blank_hf_token(mock_sentence_transformer, monkeypatch):
+    mock_sentence_transformer.side_effect = [OSError("not cached"), MagicMock()]
+    monkeypatch.setattr(settings, "HF_TOKEN", "  ")
+
+    Embedder("anonymous-download-model")
+
+    assert mock_sentence_transformer.call_args_list[1].kwargs == {
+        "cache_folder": settings.HUGGINGFACE_CACHE_DIR,
+    }
 
 
 def test_embed_rejects_invalid_items_and_dimension_changes(mock_sentence_transformer):

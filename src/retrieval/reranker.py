@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from numbers import Real
 
 import numpy as np
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import LocalEntryNotFoundError
 from sentence_transformers import CrossEncoder
 
 from src.config import settings
@@ -16,9 +18,22 @@ class Reranker:
     """Rerank candidates while preserving their chunks and retrieval scores."""
 
     def __init__(self) -> None:
+        try:
+            model_path = snapshot_download(
+                repo_id=settings.RERANKER_MODEL,
+                cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+                local_files_only=True,
+            )
+        except LocalEntryNotFoundError:
+            token = settings.HF_TOKEN
+            model_path = snapshot_download(
+                repo_id=settings.RERANKER_MODEL,
+                cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+                **({"token": token.strip()} if isinstance(token, str) and token.strip() else {}),
+            )
         self.model = CrossEncoder(
-            settings.RERANKER_MODEL,
-            cache_folder=settings.HUGGINGFACE_CACHE_DIR,
+            model_path,
+            local_files_only=True,
         )
 
     def rerank(

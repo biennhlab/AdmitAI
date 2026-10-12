@@ -1,3 +1,4 @@
+import logging
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -368,3 +369,42 @@ def test_rag_chain_empty_question():
     
     # Invalid input must not spend an LLM call or fabricate an answer.
     mock_llm.generate.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_rag_timing_logs_all_stages_without_query_or_content(caplog, streaming):
+    question = "admission-private-query"
+    chunk = MockChunk("winner", "admission private query sensitive-content")
+    reranker = SimpleNamespace(
+        rerank=lambda _query, candidates, top_k: [
+            (candidate, score, 1.0) for candidate, score in candidates[:top_k]
+        ]
+    )
+    llm = MagicMock()
+    llm.generate.return_value = "Supported [1]"
+    llm.generate_stream.return_value = iter(["Supported [1]"])
+    chain = RAGChain(MockRetriever([chunk]), llm, reranker=reranker)
+
+    with caplog.at_level(logging.INFO, logger="src.generation.rag_chain"):
+        if streaming:
+            list(chain.answer_stream(question))
+        else:
+            chain.answer(question)
+
+    timing_messages = [message for message in caplog.messages if message.startswith("rag_timing")]
+    assert {message.split()[1] for message in timing_messages} == {
+        "stage=query_transform",
+        "stage=retrieval",
+        "stage=rerank",
+        "stage=generation",
+        "stage=total",
+    }
+    combined = "\n".join(timing_messages)
+    assert "stage=retrieval" in combined and "candidates=1" in combined
+    assert "stage=rerank" in combined
+    assert "input_candidates=1" in combined
+    assert "output_candidates=1" in combined
+    assert "avg_candidate_chars=" in combined
+    assert "max_candidate_chars=" in combined
+    assert question not in combined
+    assert chunk.content not in combined

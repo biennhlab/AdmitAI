@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -26,9 +27,11 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
     HUGGINGFACE_CACHE_DIR: str = DEFAULT_HUGGINGFACE_CACHE_DIR
+    HF_TOKEN: str | None = None
     
     RETRIEVAL_TOP_K: int = 20
     RETRIEVAL_CANDIDATE_MULTIPLIER: int = 3
+    RERANK_CANDIDATE_K: int = Field(default=8, gt=0)
     RERANK_TOP_K: int = 5
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 100

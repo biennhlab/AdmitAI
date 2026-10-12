@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
+import logging
 import math
 from numbers import Real
 import re
+import time
 from typing import Any, List, Optional
 
 from ..config import settings
 from ..query_transform import AbbreviationNormalizer, QueryRewriter
+from ..retrieval.document import chunk_search_text
 from .prompts import SYSTEM_PROMPT, build_rag_prompt, format_citations
 
 
 FALLBACK_ANSWER = "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có."
+logger = logging.getLogger(__name__)
 
 
 class RAGRetrievalError(RuntimeError):
@@ -49,6 +54,13 @@ class _CitationSource:
     retrieval_score: float
 
 
+@dataclass
+class _GenerationInput:
+    sources: list[_CitationSource]
+    system_prompt: str
+    messages: list[dict[str, str]]
+
+
 class RAGChain:
     """Retrieve, ground generation, and return citations from real metadata."""
 
@@ -81,21 +93,50 @@ class RAGChain:
             return normalized
         return self.query_rewriter.rewrite(normalized)
 
+    @staticmethod
+    def _log_timing(stage: str, started_at: float, **fields: int | float) -> None:
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        suffix = "".join(f" {key}={value}" for key, value in fields.items())
+        logger.info("rag_timing stage=%s duration_ms=%.3f%s", stage, duration_ms, suffix)
+
+    @contextmanager
+    def _timed_stage(self, stage: str):
+        started_at = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._log_timing(stage, started_at)
+
     def _assemble_context(
         self, query: str, retrieved: list[tuple[Any, float]]
     ) -> list[tuple[Any, float]]:
         from .assembler import ContextAssembler
 
-        if self.reranker is not None and retrieved:
-            try:
-                limit = settings.RERANK_TOP_K
-                reranked = self.reranker.rerank(query, retrieved, top_k=limit)
-                expected = min(len(retrieved), max(0, limit))
+        rerank_started_at = time.perf_counter()
+        rerank_input = retrieved
+        rerank_output = retrieved
+        char_fields: dict[str, int | float] = {}
+        try:
+            if self.reranker is not None and retrieved:
+                candidate_k = settings.RERANK_CANDIDATE_K
+                if candidate_k <= 0:
+                    raise ValueError("RERANK_CANDIDATE_K must be greater than 0")
+                candidates = retrieved[:candidate_k]
+                rerank_input = candidates
+                rerank_output = []
+                candidate_chars = [len(chunk_search_text(chunk)) for chunk, _ in candidates]
+                char_fields = {
+                    "avg_candidate_chars": round(sum(candidate_chars) / len(candidate_chars), 1),
+                    "max_candidate_chars": max(candidate_chars),
+                }
+                limit = min(max(0, settings.RERANK_TOP_K), len(candidates))
+                reranked = self.reranker.rerank(query, candidates, top_k=limit)
+                expected = limit
                 if not isinstance(reranked, list) or len(reranked) != expected:
                     raise ValueError("Reranker returned an invalid result count")
                 # Validate membership with multiplicity: no invented chunks, changed
                 # retrieval scores, or repeated results absent from the input.
-                available = Counter((id(chunk), score) for chunk, score in retrieved)
+                available = Counter((id(chunk), score) for chunk, score in candidates)
                 previous_rank = None
                 for item in reranked:
                     if not isinstance(item, tuple) or len(item) != 3:
@@ -115,9 +156,18 @@ class RAGChain:
                     if previous_rank is not None and rank < previous_rank:
                         raise ValueError("Reranker returned results out of order")
                     previous_rank = rank
-                retrieved = [(chunk, score) for chunk, score, _ in reranked]
-            except Exception as exc:
-                raise RAGRerankingError("Reranking dependency failed") from exc
+                rerank_output = [(chunk, score) for chunk, score, _ in reranked]
+                retrieved = rerank_output
+        except Exception as exc:
+            raise RAGRerankingError("Reranking dependency failed") from exc
+        finally:
+            self._log_timing(
+                "rerank",
+                rerank_started_at,
+                input_candidates=len(rerank_input),
+                output_candidates=len(rerank_output),
+                **char_fields,
+            )
 
         assembled = ContextAssembler(max_chars=12000).assemble(retrieved)
         if self.reranker is not None:
@@ -128,6 +178,49 @@ class RAGChain:
                 positions.setdefault(id(chunk), index)
             assembled.sort(key=lambda item: positions[id(item[0])])
         return assembled
+
+    def _prepare_generation(
+        self,
+        question: str,
+        session_history: Optional[List[dict]],
+    ) -> _GenerationInput | None:
+        query_started_at = time.perf_counter()
+        try:
+            retrieval_query = self._retrieval_query(question)
+        finally:
+            self._log_timing("query_transform", query_started_at)
+
+        retrieval_started_at = time.perf_counter()
+        retrieved: list[tuple[Any, float]] = []
+        try:
+            retrieved = self.retriever.search(retrieval_query, top_k=self.top_k)
+        except Exception as exc:
+            raise RAGRetrievalError("Retrieval dependency failed") from exc
+        finally:
+            self._log_timing("retrieval", retrieval_started_at, candidates=len(retrieved))
+
+        if self.min_score is not None:
+            retrieved = [(chunk, score) for chunk, score in retrieved if score >= self.min_score]
+
+        final_retrieved = self._assemble_context(retrieval_query, retrieved)
+        if not final_retrieved or not self._has_lexical_evidence(question, final_retrieved):
+            return None
+
+        sources = self._select_citation_sources(
+            question, final_retrieved, preserve_order=self.reranker is not None
+        )
+        chunks = [source.prompt_chunk for source in sources]
+        scores = [source.retrieval_score for source in sources]
+        context = format_citations(chunks, scores)
+        messages: list[dict[str, str]] = []
+        if session_history:
+            messages.extend(session_history)
+        messages.extend(build_rag_prompt(chunks, question))
+        return _GenerationInput(
+            sources=sources,
+            system_prompt=SYSTEM_PROMPT.format(context=context),
+            messages=messages,
+        )
 
     @staticmethod
     def _evidence_tokens(text: str) -> set[str]:
@@ -444,119 +537,86 @@ class RAGChain:
         return cleaned.strip()
 
     def answer_stream(self, question: str, session_history: Optional[List[dict]] = None) -> Any:
-        if not question or not question.strip():
-            yield {"type": "metadata", "citations": [], "route_type": "out_of_scope"}
-            yield {"type": "chunk", "text": FALLBACK_ANSWER}
-            return
+        with self._timed_stage("total"):
+            if not question or not question.strip():
+                yield {"type": "metadata", "citations": [], "route_type": "out_of_scope"}
+                yield {"type": "chunk", "text": FALLBACK_ANSWER}
+                return
 
-        retrieval_query = self._retrieval_query(question)
-        try:
-            retrieved = self.retriever.search(retrieval_query, top_k=self.top_k)
-        except Exception as exc:
-            raise RAGRetrievalError("Retrieval dependency failed") from exc
-            
-        if self.min_score is not None:
-            retrieved = [(chunk, score) for chunk, score in retrieved if score >= self.min_score]
-            
-        final_retrieved = self._assemble_context(retrieval_query, retrieved)
+            prepared = self._prepare_generation(question, session_history)
+            if prepared is None:
+                yield {"type": "metadata", "citations": [], "route_type": "out_of_scope"}
+                yield {"type": "chunk", "text": FALLBACK_ANSWER}
+                return
 
-        if not final_retrieved or not self._has_lexical_evidence(question, final_retrieved):
-            yield {"type": "metadata", "citations": [], "route_type": "out_of_scope"}
-            yield {"type": "chunk", "text": FALLBACK_ANSWER}
-            return
+            accumulator = ""
+            answer_parts: list[str] = []
+            started_streaming = False
+            close_pattern = re.compile(r"</(?:assistant_answer|answer|response|final)>.*", re.IGNORECASE | re.DOTALL)
 
-        sources = self._select_citation_sources(
-            question, final_retrieved, preserve_order=self.reranker is not None
-        )
-        chunks = [source.prompt_chunk for source in sources]
-        scores = [source.retrieval_score for source in sources]
-        context = format_citations(chunks, scores)
-        system_prompt = SYSTEM_PROMPT.format(context=context)
-
-        messages: list[dict[str, str]] = []
-        if session_history:
-            messages.extend(session_history)
-        messages.extend(build_rag_prompt(chunks, question))
-        
-        generator = self.llm_client.generate_stream(system_prompt=system_prompt, messages=messages)
-        
-        accumulator = ""
-        answer_parts: list[str] = []
-        started_streaming = False
-        close_pattern = re.compile(r"</(?:assistant_answer|answer|response|final)>.*", re.IGNORECASE | re.DOTALL)
-        
-        for chunk_text in generator:
-            accumulator += chunk_text
-            if not started_streaming:
-                visible = self._strip_leading_model_blocks(
-                    accumulator,
-                    wait_for_incomplete=True,
+            with self._timed_stage("generation"):
+                generator = self.llm_client.generate_stream(
+                    system_prompt=prepared.system_prompt,
+                    messages=prepared.messages,
                 )
-                if visible is None:
-                    continue
-                accumulator = visible
-                if not accumulator:
-                    continue
-                started_streaming = True
-            
-            if started_streaming:
-                closing = close_pattern.search(accumulator)
-                if closing:
-                    emit = accumulator[:closing.start()]
-                    accumulator = ""
-                    if emit:
-                        answer_parts.append(emit)
-                        yield {"type": "chunk", "text": emit}
-                    break
-                if len(accumulator) > 30:
-                    emit = accumulator[:-30]
-                    accumulator = accumulator[-30:]
-                    answer_parts.append(emit)
-                    yield {"type": "chunk", "text": emit}
-                        
-        if started_streaming and accumulator:
-            accumulator = close_pattern.sub("", accumulator)
-            if accumulator:
-                answer_parts.append(accumulator)
-                yield {"type": "chunk", "text": accumulator}
+                for chunk_text in generator:
+                    accumulator += chunk_text
+                    if not started_streaming:
+                        visible = self._strip_leading_model_blocks(
+                            accumulator,
+                            wait_for_incomplete=True,
+                        )
+                        if visible is None:
+                            continue
+                        accumulator = visible
+                        if not accumulator:
+                            continue
+                        started_streaming = True
 
-        citations = self._citations_for_answer(sources, "".join(answer_parts), question)
-        yield {"type": "metadata", "citations": citations, "route_type": "general"}
+                    if started_streaming:
+                        closing = close_pattern.search(accumulator)
+                        if closing:
+                            emit = accumulator[:closing.start()]
+                            accumulator = ""
+                            if emit:
+                                answer_parts.append(emit)
+                                yield {"type": "chunk", "text": emit}
+                            break
+                        if len(accumulator) > 30:
+                            emit = accumulator[:-30]
+                            accumulator = accumulator[-30:]
+                            answer_parts.append(emit)
+                            yield {"type": "chunk", "text": emit}
+
+                if started_streaming and accumulator:
+                    accumulator = close_pattern.sub("", accumulator)
+                    if accumulator:
+                        answer_parts.append(accumulator)
+                        yield {"type": "chunk", "text": accumulator}
+
+            citations = self._citations_for_answer(
+                prepared.sources, "".join(answer_parts), question
+            )
+            yield {"type": "metadata", "citations": citations, "route_type": "general"}
 
     def answer(self, question: str, session_history: Optional[List[dict]] = None) -> RAGResponse:
-        if not question or not question.strip():
-            return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
+        with self._timed_stage("total"):
+            if not question or not question.strip():
+                return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
 
-        retrieval_query = self._retrieval_query(question)
-        try:
-            retrieved = self.retriever.search(retrieval_query, top_k=self.top_k)
-        except Exception as exc:
-            raise RAGRetrievalError("Retrieval dependency failed") from exc
-        if self.min_score is not None:
-            retrieved = [(chunk, score) for chunk, score in retrieved if score >= self.min_score]
-            
-        final_retrieved = self._assemble_context(retrieval_query, retrieved)
+            prepared = self._prepare_generation(question, session_history)
+            if prepared is None:
+                return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
 
-        if not final_retrieved or not self._has_lexical_evidence(question, final_retrieved):
-            return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
+            with self._timed_stage("generation"):
+                answer = self._clean_answer(
+                    self.llm_client.generate(
+                        system_prompt=prepared.system_prompt,
+                        messages=prepared.messages,
+                    )
+                )
 
-        sources = self._select_citation_sources(
-            question, final_retrieved, preserve_order=self.reranker is not None
-        )
-        chunks = [source.prompt_chunk for source in sources]
-        scores = [source.retrieval_score for source in sources]
-        context = format_citations(chunks, scores)
-        system_prompt = SYSTEM_PROMPT.format(context=context)
-
-        messages: list[dict[str, str]] = []
-        if session_history:
-            messages.extend(session_history)
-        messages.extend(build_rag_prompt(chunks, question))
-        answer = self._clean_answer(
-            self.llm_client.generate(system_prompt=system_prompt, messages=messages)
-        )
-
-        # The marker field maps each returned citation to its numbered document,
-        # including when the answer cites only a subset of the context.
-        citations = self._citations_for_answer(sources, answer, question)
-        return RAGResponse(answer, citations, "general")
+            # The marker field maps each returned citation to its numbered document,
+            # including when the answer cites only a subset of the context.
+            citations = self._citations_for_answer(prepared.sources, answer, question)
+            return RAGResponse(answer, citations, "general")

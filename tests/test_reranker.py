@@ -1,13 +1,14 @@
 from copy import deepcopy
 from itertools import permutations
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 import re
 
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
-from src.config import settings
+from src.config import Settings, settings
 from src.ingestion.chunker import Chunk
 from src.retrieval import reranker as reranker_module
 from src.retrieval.document import chunk_search_text
@@ -19,15 +20,25 @@ from src.generation.rag_chain import (
 
 @pytest.fixture(autouse=True)
 def mock_cross_encoder():
-    with patch("src.retrieval.reranker.CrossEncoder") as factory:
+    with (
+        patch("src.retrieval.reranker.CrossEncoder", autospec=True) as factory,
+        patch("src.retrieval.reranker.snapshot_download", autospec=True) as download,
+    ):
+        download.return_value = "D:/models/reranker/snapshot"
+        factory.snapshot_download_mock = download
         yield factory
 
 
 def test_loads_configured_model(mock_cross_encoder):
     reranker = Reranker()
+    mock_cross_encoder.snapshot_download_mock.assert_called_once_with(
+        repo_id=settings.RERANKER_MODEL,
+        cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+        local_files_only=True,
+    )
     mock_cross_encoder.assert_called_once_with(
-        settings.RERANKER_MODEL,
-        cache_folder=settings.HUGGINGFACE_CACHE_DIR,
+        "D:/models/reranker/snapshot",
+        local_files_only=True,
     )
     assert reranker.model is mock_cross_encoder.return_value
 
@@ -38,6 +49,58 @@ def test_load_failure_is_immediate(mock_cross_encoder):
     with pytest.raises(OSError) as caught:
         Reranker()
     assert caught.value is error
+
+
+def test_missing_local_snapshot_downloads_into_configured_cache(mock_cross_encoder, monkeypatch):
+    monkeypatch.setattr(settings, "HF_TOKEN", None)
+    missing = reranker_module.LocalEntryNotFoundError("not cached")
+    mock_cross_encoder.snapshot_download_mock.side_effect = [missing, "D:/models/downloaded/snapshot"]
+
+    reranker = Reranker()
+
+    assert mock_cross_encoder.snapshot_download_mock.call_args_list == [
+        call(
+            repo_id=settings.RERANKER_MODEL,
+            cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+            local_files_only=True,
+        ),
+        call(
+            repo_id=settings.RERANKER_MODEL,
+            cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+        ),
+    ]
+    mock_cross_encoder.assert_called_once_with(
+        "D:/models/downloaded/snapshot",
+        local_files_only=True,
+    )
+    assert reranker.model is mock_cross_encoder.return_value
+
+
+def test_missing_local_snapshot_uses_configured_hf_token(mock_cross_encoder, monkeypatch):
+    monkeypatch.setattr(settings, "HF_TOKEN", "  hf_test_token  ")
+    missing = reranker_module.LocalEntryNotFoundError("not cached")
+    mock_cross_encoder.snapshot_download_mock.side_effect = [missing, "D:/models/downloaded/snapshot"]
+
+    Reranker()
+
+    assert mock_cross_encoder.snapshot_download_mock.call_args_list[1] == call(
+        repo_id=settings.RERANKER_MODEL,
+        cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+        token="hf_test_token",
+    )
+
+
+def test_missing_local_snapshot_omits_blank_hf_token(mock_cross_encoder, monkeypatch):
+    monkeypatch.setattr(settings, "HF_TOKEN", "  ")
+    missing = reranker_module.LocalEntryNotFoundError("not cached")
+    mock_cross_encoder.snapshot_download_mock.side_effect = [missing, "D:/models/downloaded/snapshot"]
+
+    Reranker()
+
+    assert mock_cross_encoder.snapshot_download_mock.call_args_list[1] == call(
+        repo_id=settings.RERANKER_MODEL,
+        cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+    )
 
 
 def test_reranks_in_one_batch_and_preserves_inputs(mock_cross_encoder):
@@ -206,6 +269,147 @@ def run_chain(chain, streaming, question="admission", history=None):
             citations=metadata["citations"], route_type=metadata["route_type"],
         )
     return chain.answer(question, history)
+
+
+def test_rerank_candidate_k_must_be_positive():
+    with pytest.raises(ValidationError, match="RERANK_CANDIDATE_K"):
+        Settings(_env_file=None, RERANK_CANDIDATE_K=0)
+
+
+def test_default_rerank_candidate_pool_keeps_headroom_above_top_k():
+    candidate_k = Settings.model_fields["RERANK_CANDIDATE_K"].default
+    top_k = Settings.model_fields["RERANK_TOP_K"].default
+
+    assert candidate_k == 8
+    assert candidate_k > top_k
+
+
+@pytest.mark.parametrize("retrieved_count, expected_input", [(60, 10), (7, 7)])
+def test_rag_chain_caps_candidates_before_cross_encoder(
+    mock_cross_encoder, monkeypatch, retrieved_count, expected_input,
+):
+    monkeypatch.setattr(settings, "RERANK_CANDIDATE_K", 10)
+    monkeypatch.setattr(settings, "RERANK_TOP_K", 5)
+    candidates = [
+        (Chunk(str(index), f"admission candidate {index}"), 1.0 - index / 100)
+        for index in range(retrieved_count)
+    ]
+    original = list(candidates)
+    mock_cross_encoder.return_value.predict.return_value = list(range(expected_input))
+
+    assembled = RAGChain(
+        RecordingRetriever(candidates), RecordingLLM(), top_k=retrieved_count, reranker=Reranker()
+    )._assemble_context("admission", candidates)
+
+    model_pairs = mock_cross_encoder.return_value.predict.call_args.args[0]
+    assert len(model_pairs) == expected_input
+    assert len(assembled) <= 5
+    assert candidates == original
+    assert all(actual is expected for actual, expected in zip(candidates, original))
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_candidate_at_cap_boundary_can_win_but_next_candidate_is_never_scored(
+    mock_cross_encoder, monkeypatch, streaming,
+):
+    monkeypatch.setattr(settings, "RERANK_CANDIDATE_K", 10)
+    monkeypatch.setattr(settings, "RERANK_TOP_K", 5)
+    candidates = [
+        (
+            Chunk(
+                str(index + 1),
+                f"admission method candidate {index + 1}",
+                {
+                    "doc_id": f"doc-{index + 1}",
+                    "source_url": f"https://example.org/{index + 1}",
+                },
+            ),
+            1.0 - index / 100,
+        )
+        for index in range(12)
+    ]
+    seen_pairs = []
+
+    def predict(pairs):
+        seen_pairs.extend(pairs)
+        return [0.0] * 9 + [100.0]
+
+    mock_cross_encoder.return_value.predict.side_effect = predict
+    result = run_chain(
+        RAGChain(
+            RecordingRetriever(candidates),
+            RecordingLLM("Winning evidence [1]"),
+            top_k=12,
+            reranker=Reranker(),
+        ),
+        streaming,
+    )
+
+    assert len(seen_pairs) == 10
+    assert [text for _, text in seen_pairs] == [chunk.content for chunk, _ in candidates[:10]]
+    assert all(candidates[10][0].content != text for _, text in seen_pairs)
+    assert result.citations[0]["chunk_id"] == "10"
+    assert result.citations[0]["doc_id"] == "doc-10"
+    assert result.citations[0]["source_url"] == "https://example.org/10"
+    assert result.citations[0]["score"] == candidates[9][1]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_without_reranker_legacy_flow_does_not_apply_candidate_cap(monkeypatch, streaming):
+    monkeypatch.setattr(settings, "RERANK_CANDIDATE_K", 10)
+    candidates = [
+        (Chunk(str(index), f"admission candidate {index}", {"doc_id": str(index)}), 1.0)
+        for index in range(15)
+    ]
+    captured = []
+    from src.generation.assembler import ContextAssembler
+    original_assemble = ContextAssembler.assemble
+
+    def capture_assemble(self, retrieved):
+        captured.extend(retrieved)
+        return original_assemble(self, retrieved)
+
+    with patch.object(ContextAssembler, "assemble", capture_assemble):
+        run_chain(
+            RAGChain(RecordingRetriever(candidates), RecordingLLM("Evidence [1]"), top_k=15),
+            streaming,
+        )
+
+    assert [id(chunk) for chunk, _ in captured] == [id(chunk) for chunk, _ in candidates]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_coverage_hybrid_can_return_sixty_but_cross_encoder_receives_ten(
+    mock_cross_encoder, monkeypatch, streaming,
+):
+    from src.retrieval.fusion import HybridRetriever
+
+    monkeypatch.setattr(settings, "RERANK_CANDIDATE_K", 10)
+    monkeypatch.setattr(settings, "RERANK_TOP_K", 5)
+    query = "PTIT có những phương thức tuyển sinh nào trong năm 2026?"
+    chunks = [
+        Chunk(
+            f"coverage-{index:02d}",
+            f"PTIT phương thức tuyển sinh năm 2026 mục {index}",
+            {"doc_id": f"coverage-doc-{index}"},
+        )
+        for index in range(60)
+    ]
+    ranked = [(chunk, 1.0 - index / 100) for index, chunk in enumerate(chunks)]
+    dense = SimpleNamespace(search=lambda _query, top_k: ranked[:top_k])
+    sparse = SimpleNamespace(search=lambda _query, top_k: ranked[:top_k])
+    hybrid = HybridRetriever(dense, sparse)
+    assert len(hybrid.search(query, top_k=20)) == 60
+    mock_cross_encoder.return_value.predict.return_value = list(range(10))
+
+    result = run_chain(
+        RAGChain(hybrid, RecordingLLM("Evidence [1]"), top_k=20, reranker=Reranker()),
+        streaming,
+        query,
+    )
+
+    assert len(mock_cross_encoder.return_value.predict.call_args.args[0]) == 10
+    assert len(result.citations) == 1
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -469,8 +673,8 @@ def test_api_initialization_enables_real_reranker(mock_cross_encoder, isolated_c
     assert chat.rag_chain.top_k == settings.RETRIEVAL_TOP_K
     assert chat.rag_chain.min_score is None
     mock_cross_encoder.assert_called_once_with(
-        settings.RERANKER_MODEL,
-        cache_folder=settings.HUGGINGFACE_CACHE_DIR,
+        "D:/models/reranker/snapshot",
+        local_files_only=True,
     )
 
 

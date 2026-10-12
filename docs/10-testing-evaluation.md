@@ -181,29 +181,28 @@ def test_admin_with_auth():
 
 ### 4.2 Golden Dataset
 
-Tạo bộ test ~30-50 câu hỏi có ground truth answer.
+Golden dataset đã được kiểm chứng trong [`eval/golden_dataset.json`](../eval/golden_dataset.json):
 
-```json
-[
-  {
-    "question": "Điểm chuẩn ngành Công nghệ thông tin năm 2024 là bao nhiêu?",
-    "ground_truth": "Điểm chuẩn ngành CNTT năm 2024 là 27.0 điểm (phương thức xét điểm thi THPT).",
-    "ground_truth_context": ["Đề án tuyển sinh 2024, trang 5"]
-  },
-  {
-    "question": "PTIT có những phương thức xét tuyển nào?",
-    "ground_truth": "PTIT có 4 phương thức: xét điểm thi THPT, xét học bạ, xét tuyển thẳng, xét tuyển kết hợp.",
-    "ground_truth_context": ["Đề án tuyển sinh 2024, trang 2-3"]
-  },
-  {
-    "question": "Học phí ngành CNTT là bao nhiêu?",
-    "ground_truth": "Học phí ngành CNTT năm 2024 là X triệu/năm.",
-    "ground_truth_context": ["Bảng học phí 2024"]
-  }
-]
+- 35 câu hỏi: 23 single-hop, 8 multi-hop và 4 negative/out-of-scope.
+- 31 câu có ground truth và evidence trỏ tới `chunk_id` thật trong index PTIT 2026.
+- Mỗi case có `expected_route`, `required_terms` và tags để đo retrieval, reranking,
+  generation và fallback độc lập.
+- `corpus.fingerprint` khóa dataset với đúng phiên bản corpus, tránh chạy eval nhầm index.
+
+Kiểm tra schema (dùng được trong CI, không cần index local):
+
+```bash
+python scripts/validate_golden_dataset.py --schema-only
 ```
 
-> **Lưu ý**: Ground truth phải lấy từ dữ liệu thật trong `data/raw/`.
+Kiểm tra toàn bộ metadata, trích dẫn và corpus fingerprint với index local:
+
+```bash
+python scripts/validate_golden_dataset.py
+```
+
+Validator sẽ fail nếu evidence không tồn tại trong manifest, metadata lệch, quote không có
+trong chunk, hoặc câu out-of-scope không dùng đúng fallback của sản phẩm.
 
 ### 4.3 Chạy RAGAS
 
