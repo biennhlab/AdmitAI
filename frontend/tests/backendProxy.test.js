@@ -1,8 +1,13 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { POST as proxyChat } from '@/app/api/chat/route.js';
 import { proxyBackend } from '@/lib/backendProxy.mjs';
 
 describe('controlled backend proxy', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it('forwards a successful JSON payload unchanged', async () => {
     const payload = { answer: 'Xin chào', citations: [], session_id: 'session-1' };
     const fetchImpl = vi.fn().mockResolvedValue(Response.json(payload));
@@ -21,9 +26,33 @@ describe('controlled backend proxy', () => {
       'http://backend:8000/api/chat',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ message: 'Xin chào' })
+        body: JSON.stringify({ message: 'Xin chào' }),
+        headers: expect.objectContaining({ accept: 'application/json' })
       })
     );
+  });
+
+  it('requests and forwards a chat event stream without buffering it as JSON', async () => {
+    const sse = 'data: {"type":"chunk","text":"Xin chào"}\n\n';
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(sse, {
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' }
+    }));
+    vi.stubGlobal('fetch', fetchImpl);
+
+    const response = await proxyChat(new Request('http://frontend.test/api/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: 'Xin chào' })
+    }));
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      expect.stringMatching(/\/api\/chat$/),
+      expect.objectContaining({
+        headers: expect.objectContaining({ accept: 'text/event-stream' })
+      })
+    );
+    expect(response.headers.get('content-type')).toContain('text/event-stream');
+    expect(await response.text()).toBe(sse);
   });
 
   it('maps a backend 503 without leaking its raw detail', async () => {

@@ -55,6 +55,7 @@ export async function proxyBackend(
   {
     method = "GET",
     body,
+    accept = "application/json",
     fetchImpl = fetch,
     timeoutMs = backendTimeoutMs(),
     baseUrl = backendBaseUrl(),
@@ -68,7 +69,7 @@ export async function proxyBackend(
     upstream = await fetchImpl(`${baseUrl}${path}`, {
       method,
       headers: {
-        accept: "application/json",
+        accept,
         ...(body === undefined ? {} : { "content-type": "application/json" }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),

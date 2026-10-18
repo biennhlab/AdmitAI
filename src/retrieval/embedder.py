@@ -46,9 +46,11 @@ class Embedder:
             # as AttributeError rather than OSError. In that case, let the
             # normal Hugging Face resolution path repair/download the model.
             except (OSError, ValueError, AttributeError):
+                token = settings.HF_TOKEN
                 model = SentenceTransformer(
                     model_name,
                     cache_folder=settings.HUGGINGFACE_CACHE_DIR,
+                    **({"token": token.strip()} if isinstance(token, str) and token.strip() else {}),
                 )
             cls._model_cache[cache_key] = model
             return model

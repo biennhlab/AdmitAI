@@ -8,5 +8,9 @@ export async function POST(request) {
     return structuredError('INTERNAL_ERROR', 400);
   }
 
-  return proxyBackend('/api/chat', { method: 'POST', body });
+  return proxyBackend('/api/chat', {
+    method: 'POST',
+    body,
+    accept: 'text/event-stream'
+  });
 }
