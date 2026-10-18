@@ -244,13 +244,13 @@ def test_rag_chain_answer_order():
     retriever = MockRetriever(chunks)
     
     mock_llm = MagicMock()
-    mock_llm.generate.return_value = "Answer generated"
+    mock_llm.generate.return_value = "Answer generated [1]"
     
     chain = RAGChain(retriever, mock_llm)
     
     response = chain.answer("Info?")
     
-    assert response.answer == "Answer generated"
+    assert response.answer == "Answer generated [1]"
     assert response.citations[0]["source"] == "file.pdf"
     assert response.route_type == "general"
     
@@ -323,6 +323,116 @@ def test_rag_chain_cites_each_chunk_from_the_same_document_without_a_two_source_
     assert [citation["chunk_id"] for citation in citations] == ["1", "2", "3", "4"]
     for index in range(1, 5):
         assert f'<document id="{index}"' in system_prompt
+
+
+@pytest.mark.parametrize(
+    "answer,expected_markers",
+    [
+        ("Only second [2]", [2]),
+        ("Repeated first [1] [1]", [1]),
+        ("Unknown source [99]", []),
+        ("No marker at all", []),
+    ],
+)
+@pytest.mark.parametrize("streaming", [False, True])
+def test_rag_chain_returns_only_valid_referenced_markers(
+    answer, expected_markers, streaming,
+):
+    chunks = [
+        MockChunk("a", "admission alpha", {"doc_id": "a", "page_number": 1}),
+        MockChunk("b", "admission beta", {"doc_id": "b", "page_number": 2}),
+    ]
+    llm = MagicMock()
+    llm.generate.return_value = answer
+    llm.generate_stream.return_value = iter([answer[:3], answer[3:]])
+    chain = RAGChain(MockRetriever(chunks), llm)
+
+    if streaming:
+        citations = list(chain.answer_stream("admission"))[-1]["citations"]
+    else:
+        citations = chain.answer("admission").citations
+
+    assert [citation["marker"] for citation in citations] == expected_markers
+
+
+def test_marker_validation_log_does_not_include_query_or_answer(caplog):
+    question = "admission-private-query"
+    answer = "sensitive answer without marker"
+    llm = MagicMock()
+    llm.generate.return_value = answer
+
+    with caplog.at_level(logging.WARNING, logger="src.generation.rag_chain"):
+        response = RAGChain(
+            MockRetriever([MockChunk("a", "admission private query evidence")]),
+            llm,
+        ).answer(question)
+
+    assert response.citations == []
+    messages = "\n".join(caplog.messages)
+    assert "citation_marker_validation status=missing" in messages
+    assert question not in messages
+    assert answer not in messages
+
+
+def test_citation_collision_keeps_content_and_metadata_from_each_evidence(caplog):
+    chunks = [
+        MockChunk(
+            "same-id",
+            "admission BVH evidence",
+            {"doc_id": "doc-a", "page_number": 1, "source_url": "https://a.test"},
+        ),
+        MockChunk(
+            "same-id",
+            "admission BVS evidence",
+            {"doc_id": "doc-b", "page_number": 2, "source_url": "https://b.test"},
+        ),
+    ]
+    llm = MagicMock()
+    llm.generate.return_value = "BVH [1]. BVS [2]."
+
+    with caplog.at_level(logging.WARNING, logger="src.generation.rag_chain"):
+        response = RAGChain(MockRetriever(chunks), llm).answer("admission BVH BVS")
+
+    assert [citation["doc_id"] for citation in response.citations] == ["doc-a", "doc-b"]
+    assert [citation["page"] for citation in response.citations] == [1, 2]
+    assert [citation["source_url"] for citation in response.citations] == [
+        "https://a.test",
+        "https://b.test",
+    ]
+    assert response.citations[0]["snippet"] in chunks[0].content
+    assert response.citations[1]["snippet"] in chunks[1].content
+    assert any("citation_identity_collision" in message for message in caplog.messages)
+
+
+def test_table_excerpt_prefers_matching_year_campus_and_value():
+    content = "\n".join(
+        [
+            "| Năm | Cơ sở | Điểm chuẩn |",
+            "| --- | --- | --- |",
+            "| 2026 | BVS | 25.0 |",
+            "| 2026 | BVH | 27.5 |",
+        ]
+    )
+    chunk = MockChunk(
+        "table",
+        content,
+        {
+            "doc_id": "admissions-2026",
+            "page_number": 7,
+            "source_url": "https://example.test/2026.pdf",
+        },
+    )
+    llm = MagicMock()
+    llm.generate.return_value = "Điểm chuẩn BVH năm 2026 là 27.5 [1]."
+
+    citation = RAGChain(MockRetriever([chunk]), llm).answer(
+        "Điểm chuẩn BVH năm 2026 là bao nhiêu?"
+    ).citations[0]
+
+    assert citation["snippet"] == "| 2026 | BVH | 27.5 |"
+    assert citation["doc_id"] == "admissions-2026"
+    assert citation["page"] == 7
+    assert citation["source_url"] == "https://example.test/2026.pdf"
 
 
 @pytest.mark.parametrize("chunk_size", [1, 7, 19, 31, 200])

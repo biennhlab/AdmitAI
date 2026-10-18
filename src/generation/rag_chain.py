@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import hashlib
+import logging
 import math
 from numbers import Real
 import re
@@ -176,14 +178,80 @@ class RAGChain:
         }
 
     @staticmethod
-    def _source_identity(chunk: Any) -> str:
-        """Return a stable internal identity without inventing a public URL."""
+    def _freeze_identity_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return tuple(
+                sorted(
+                    (str(key), RAGChain._freeze_identity_value(item))
+                    for key, item in value.items()
+                )
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(RAGChain._freeze_identity_value(item) for item in value)
+        if isinstance(value, set):
+            return tuple(
+                sorted(repr(RAGChain._freeze_identity_value(item)) for item in value)
+            )
+        try:
+            hash(value)
+        except TypeError:
+            return repr(value)
+        return value
+
+    @classmethod
+    def _provenance_identity(cls, chunk: Any) -> tuple[Any, ...]:
         metadata = getattr(chunk, "metadata", {}) or {}
-        for key in ("source_url", "raw_file", "parent_doc_id", "doc_id", "source_file"):
-            value = str(metadata.get(key) or "").strip()
-            if value:
-                return f"{key}:{value.casefold()}"
-        return f"chunk:{getattr(chunk, 'chunk_id', '')}"
+        source = tuple(
+            (key, str(metadata.get(key)).strip().casefold())
+            for key in ("doc_id", "source_url", "source_file", "raw_file", "parent_doc_id")
+            if metadata.get(key) not in (None, "")
+        )
+        has_locator = any(
+            metadata.get(key) not in (None, "", [])
+            for key in ("page_number", "section", "heading", "heading_path")
+        )
+        details = tuple(
+            (key, cls._freeze_identity_value(metadata.get(key)))
+            for key in (
+                "page_number",
+                "section",
+                "heading",
+                "heading_path",
+                "admission_year",
+                "academic_year",
+                "version",
+                "content_hash",
+                "updated_at",
+                "provenance",
+                "title",
+                "source",
+                "source_type",
+                "published_at",
+                "retrieved_at",
+                "chunk_type",
+                "parent_chunk_id",
+            )
+        )
+        chunk_id = str(getattr(chunk, "chunk_id", "") or "").strip()
+        if source and has_locator:
+            return "source", source, details
+        if chunk_id:
+            return "chunk", source, chunk_id, details
+        return ()
+
+    @classmethod
+    def _source_identity(cls, chunk: Any) -> str:
+        """Return a stable opaque provenance identity without inventing a URL."""
+        identity = cls._provenance_identity(chunk)
+        if not identity:
+            return ""
+        return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def _evidence_identity(cls, chunk: Any, position: int) -> str:
+        provenance = cls._source_identity(chunk) or f"position:{position}"
+        content = " ".join(str(getattr(chunk, "content", "")).split()).casefold()
+        return hashlib.sha256(repr((provenance, content)).encode("utf-8")).hexdigest()
 
     @classmethod
     def _select_citation_sources(
@@ -197,8 +265,22 @@ class RAGChain:
         """Keep reranked order or rank by question support for legacy callers."""
         query_tokens = cls._citation_tokens(question)
         grouped: dict[str, list[tuple[Any, float, int]]] = {}
+        chunk_id_evidence: dict[str, tuple[str, int]] = {}
         for position, (chunk, score) in enumerate(retrieved):
-            identity = f"{cls._source_identity(chunk)}:chunk:{getattr(chunk, 'chunk_id', position)}"
+            identity = cls._evidence_identity(chunk, position)
+            chunk_id = str(getattr(chunk, "chunk_id", "") or "").strip()
+            if chunk_id:
+                previous = chunk_id_evidence.get(chunk_id)
+                if previous is not None and previous[0] != identity:
+                    collision_id = hashlib.sha256(chunk_id.encode("utf-8")).hexdigest()[:12]
+                    logger.warning(
+                        "citation_identity_collision kind=chunk_id id_hash=%s first_position=%d position=%d",
+                        collision_id,
+                        previous[1],
+                        position,
+                    )
+                else:
+                    chunk_id_evidence[chunk_id] = (identity, position)
             grouped.setdefault(identity, []).append((chunk, float(score), position))
 
         ranked_groups: list[tuple[tuple[float, ...], str, list[tuple[Any, float, int]]]] = []
@@ -234,37 +316,10 @@ class RAGChain:
         ranked_groups.sort(key=lambda item: item[0], reverse=True)
         selected: list[_CitationSource] = []
         for _, identity, members in ranked_groups[:limit]:
-            members.sort(
-                key=lambda item: (
-                    len(
-                        query_tokens
-                        & cls._citation_tokens(
-                            "\n".join(
-                                (
-                                    str((getattr(item[0], "metadata", {}) or {}).get("title") or ""),
-                                    str((getattr(item[0], "metadata", {}) or {}).get("section") or ""),
-                                    str(getattr(item[0], "content", "")),
-                                )
-                            )
-                        )
-                    ),
-                    item[1],
-                    -item[2],
-                ),
-                reverse=True,
-            )
-            representative = members[0][0]
-            unique_content: list[str] = []
-            seen_content: set[str] = set()
-            for chunk, _, _ in members:
-                content = str(getattr(chunk, "content", "")).strip()
-                normalized = " ".join(content.split()).casefold()
-                if content and normalized not in seen_content:
-                    seen_content.add(normalized)
-                    unique_content.append(content)
+            representative = min(members, key=lambda item: item[2])[0]
             prompt_chunk = _PromptChunk(
                 chunk_id=str(getattr(representative, "chunk_id", "")),
-                content="\n\n".join(unique_content),
+                content=str(getattr(representative, "content", "")),
                 metadata=dict(getattr(representative, "metadata", {}) or {}),
             )
             selected.append(
@@ -282,12 +337,28 @@ class RAGChain:
         marker_text = f"[{marker}]"
         units = re.split(r"(?<=[.!?])\s+|\n+", answer)
         matching = [unit.strip() for unit in units if marker_text in unit]
-        return " ".join(matching) if matching else answer
+        return " ".join(matching)
+
+    @staticmethod
+    def _specific_excerpt_tokens(text: str) -> set[str]:
+        without_markers = re.sub(r"\[\d+\]", " ", text)
+        tokens = re.findall(r"[\w./%+-]+", without_markers, flags=re.UNICODE)
+        return {
+            token.casefold()
+            for token in tokens
+            if any(character.isdigit() for character in token)
+            or (
+                len(token) >= 2
+                and any(character.isalpha() for character in token)
+                and token.upper() == token
+            )
+        }
 
     @classmethod
     def _best_excerpt(cls, content: str, target_text: str, max_chars: int = 360) -> str:
         """Return the source sentence, list item, or table row that best supports the claim."""
         target_tokens = cls._citation_tokens(target_text)
+        target_specific = cls._specific_excerpt_tokens(target_text)
         candidates = [
             " ".join(part.split())
             for part in re.split(r"(?<=[.!?;])\s+|\n+", content)
@@ -296,13 +367,19 @@ class RAGChain:
         if not candidates:
             return ""
 
-        def candidate_rank(candidate: str) -> tuple[int, float, int]:
+        def candidate_rank(candidate: str) -> tuple[int, int, float, int]:
             tokens = cls._citation_tokens(candidate)
             overlap = len(target_tokens & tokens)
+            specific_overlap = len(
+                target_specific & cls._specific_excerpt_tokens(candidate)
+            )
             density = overlap / max(1, len(tokens))
-            return overlap, density, -abs(len(candidate) - 220)
+            return specific_overlap, overlap, density, -abs(len(candidate) - 220)
 
         excerpt = max(candidates, key=candidate_rank)
+        best_specific, best_overlap, _, _ = candidate_rank(excerpt)
+        if best_overlap == 0 or (target_specific and best_specific == 0):
+            return ""
         if len(excerpt) <= max_chars:
             return excerpt
 
@@ -354,28 +431,38 @@ class RAGChain:
         answer: str,
         question: str,
     ) -> list[dict[str, Any]]:
-        valid_markers = {
-            int(value)
-            for value in re.findall(r"\[(\d+)\]", answer)
-            if 1 <= int(value) <= len(sources)
-        }
-        markers = sorted(valid_markers) if valid_markers else list(range(1, len(sources) + 1))
+        answer_markers = [int(value) for value in re.findall(r"\[(\d+)\]", answer)]
+        valid_markers = {marker for marker in answer_markers if 1 <= marker <= len(sources)}
+        invalid_count = sum(marker < 1 or marker > len(sources) for marker in answer_markers)
+        if not answer_markers:
+            logger.warning(
+                "citation_marker_validation status=missing source_count=%d",
+                len(sources),
+            )
+            return []
+        if invalid_count:
+            logger.warning(
+                "citation_marker_validation status=%s source_count=%d valid_count=%d invalid_count=%d",
+                "mixed" if valid_markers else "invalid",
+                len(sources),
+                len(valid_markers),
+                invalid_count,
+            )
+        markers = sorted(valid_markers)
         citations: list[dict[str, Any]] = []
         for marker in markers:
             source = sources[marker - 1]
             claim = cls._claim_for_marker(answer, marker)
             target_text = f"{claim}\n{question}"
-            target_tokens = cls._citation_tokens(target_text)
-            chunk, score = max(
-                source.members,
-                key=lambda item: (
-                    len(target_tokens & cls._citation_tokens(str(getattr(item[0], "content", "")))),
-                    item[1],
-                ),
-            )
+            chunk = source.prompt_chunk
             snippet = cls._best_excerpt(str(getattr(chunk, "content", "")), target_text)
             citations.append(
-                cls._citation(chunk, score, marker=marker, snippet=snippet)
+                cls._citation(
+                    chunk,
+                    source.retrieval_score,
+                    marker=marker,
+                    snippet=snippet,
+                )
             )
         return citations
 

@@ -217,6 +217,52 @@ def test_combined_metadata_and_parent_registry_are_consistent() -> None:
         assert chunk.metadata["parent_chunk_id"] in parent_ids
 
 
+def test_combined_preserves_same_text_on_different_pages_and_parent_links() -> None:
+    parents = []
+    chunks = combined_chunk(
+        [
+            page("Repeated admission evidence.", number=1),
+            page("Repeated admission evidence.", number=2),
+        ],
+        metadata=BASE_METADATA,
+        parent_chunks=parents,
+    )
+
+    assert [chunk.metadata["page_number"] for chunk in chunks] == [1, 2]
+    assert len({chunk.chunk_id for chunk in chunks}) == 2
+    assert len(parents) == 2
+    assert all(parent.metadata["child_count"] == 1 for parent in parents)
+    assert {
+        child_id
+        for parent in parents
+        for child_id in parent.metadata["child_chunk_ids"]
+    } == {chunk.chunk_id for chunk in chunks}
+
+
+def test_combined_preserves_identical_tables_on_different_pages() -> None:
+    rows = [["Cơ sở", "Chỉ tiêu"], ["BVH", "500"]]
+    parents = []
+    chunks = combined_chunk(
+        [
+            page(number=3, tables=[Table(rows, 3)]),
+            page(number=4, tables=[Table(rows, 4)]),
+        ],
+        metadata=BASE_METADATA,
+        parent_chunks=parents,
+    )
+    tables = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "table"]
+
+    assert len(tables) == 2
+    assert all("| Cơ sở | Chỉ tiêu |" in chunk.content for chunk in tables)
+    assert all("| BVH | 500 |" in chunk.content for chunk in tables)
+    assert [chunk.metadata["page_number"] for chunk in tables] == [3, 4]
+    assert all(chunk.chunk_id in {
+        child_id
+        for parent in parents
+        for child_id in parent.metadata["child_chunk_ids"]
+    } for chunk in tables)
+
+
 @pytest.mark.parametrize(
     "strategy",
     [structure_aware_chunk, table_aware_chunk, parent_child_chunk, combined_chunk],

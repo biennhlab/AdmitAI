@@ -551,7 +551,7 @@ def combined_chunk(
     metadata: Dict[str, Any] | None = None,
     parent_chunks: List[Chunk] | None = None,
 ) -> List[Chunk]:
-    """Return de-duplicated child + table chunks and expose parents separately."""
+    """Return child + table chunks, removing only duplicate stable identities."""
     _validate_size("max_size", max_size)
     text_pages = _pages_without_table_rows(pages)
     hierarchy = parent_child_chunk(text_pages, parent_size, child_size, metadata)
@@ -602,15 +602,12 @@ def combined_chunk(
 
     candidates = [*children, *tables]
     deduplicated: list[Chunk] = []
-    seen_content: set[str] = set()
     seen_ids: set[str] = set()
     for chunk in candidates:
-        content_key = _normalized_content(chunk.content)
-        if not content_key or content_key in seen_content or chunk.chunk_id in seen_ids:
+        if not _normalized_content(chunk.content) or chunk.chunk_id in seen_ids:
             continue
         chunk.metadata["combined_chunk_index"] = len(deduplicated)
         deduplicated.append(chunk)
-        seen_content.add(content_key)
         seen_ids.add(chunk.chunk_id)
 
     live_child_ids = {

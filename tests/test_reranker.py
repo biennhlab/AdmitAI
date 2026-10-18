@@ -212,7 +212,8 @@ def run_chain(chain, streaming, question="admission", history=None):
 @pytest.mark.parametrize("answer, expected_markers", [
     ("Claim [1] and another [2]", [1, 2]),
     ("Only second source [2] [2] [99]", [2]),
-    ("Answer without markers", [1, 2]),
+    ("Answer without markers", []),
+    ("Only invalid marker [99]", []),
 ])
 def test_integration_ranking_provenance_and_citation_mapping(
     mock_cross_encoder, monkeypatch, streaming, answer, expected_markers,
@@ -331,15 +332,23 @@ def test_integration_missing_metadata(mock_cross_encoder, streaming, metadata):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_duplicate_content_does_not_duplicate_citations(mock_cross_encoder, streaming):
+def test_duplicate_content_preserves_cross_source_citations(mock_cross_encoder, streaming):
     a = Chunk("a", "admission alpha", {"doc_id": "a"})
     duplicate = Chunk("duplicate", " admission  alpha ", {"doc_id": "other"})
     b = Chunk("b", "admission beta", {"doc_id": "b"})
     candidates = [(a, 0.8), (a, 0.8), (duplicate, 0.7), (b, 0.6)]
     mock_cross_encoder.return_value.predict.return_value = [4, 4, 3, 2]
-    result = run_chain(RAGChain(RecordingRetriever(candidates), RecordingLLM(), reranker=Reranker()), streaming)
-    assert [c["chunk_id"] for c in result.citations] == ["a", "b"]
-    assert [c["marker"] for c in result.citations] == [1, 2]
+    result = run_chain(
+        RAGChain(
+            RecordingRetriever(candidates),
+            RecordingLLM("Supported [1] [2] [3]"),
+            reranker=Reranker(),
+        ),
+        streaming,
+    )
+    assert [c["chunk_id"] for c in result.citations] == ["a", "duplicate", "b"]
+    assert [c["doc_id"] for c in result.citations] == ["a", "other", "b"]
+    assert [c["marker"] for c in result.citations] == [1, 2, 3]
 
 
 @pytest.mark.parametrize("streaming", [False, True])
