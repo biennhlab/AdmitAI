@@ -7,8 +7,9 @@ from typing import Annotated, Any
 import json
 import queue
 import threading
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,11 +25,12 @@ from src.generation.llm_client import (
     LLMRateLimitError,
     LLMTimeoutError,
 )
-from src.generation.rag_chain import RAGChain, RAGRetrievalError
+from src.generation.rag_chain import RAGChain, RAGRetrievalError, RAGGroundingError
+from src.generation.diagnostics import generation_diagnostics
 from src.generation.session_memory import SessionMemory
 from src.query_transform import AbbreviationNormalizer, QueryRewriter
 from src.retrieval import Embedder, NaiveDenseSearch, load_dense_index
-from src.retrieval.reranker import Reranker
+from src.retrieval.lite_selector import LiteEvidenceSelector
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -45,12 +47,22 @@ LLM_UNAVAILABLE_MESSAGE = "Dịch vụ xử lý câu hỏi đang tạm thời ch
 INTERNAL_ERROR_MESSAGE = "Không thể xử lý yêu cầu lúc này."
 
 
+def _build_evidence_selector() -> Any:
+    """Construct only the configured reranking backend."""
+    if settings.LOCAL_DEV_PROFILE or settings.RERANK_BACKEND == "lite":
+        return LiteEvidenceSelector()
+    if settings.RERANK_BACKEND == "neural":
+        # Keep this import lazy so lite mode never imports or constructs the
+        # heavyweight CrossEncoder implementation.
+        from src.retrieval.reranker import Reranker
+
+        return Reranker()
+    raise ValueError(f"Unsupported RERANK_BACKEND: {settings.RERANK_BACKEND}")
+
+
 def _log_queued_exception(message: str, exc: Exception) -> None:
-    """Log an exception transported from the worker thread with its traceback."""
-    logger.error(
-        message,
-        exc_info=(type(exc), exc, exc.__traceback__),
-    )
+    """Do not log provider exception text/tracebacks containing request bodies."""
+    logger.error("%s error_class=%s", message, type(exc).__name__)
 
 
 def _service_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -60,17 +72,31 @@ def _service_error(status_code: int, code: str, message: str) -> HTTPException:
     )
 
 
-def _generation_http_error(exc: Exception) -> HTTPException:
+def _generation_http_error(exc: Exception, request_id: str | None = None) -> HTTPException:
+    error = _classify_generation_error(exc)
+    if request_id:
+        error.headers = {"X-Request-ID": request_id}
+        logger.info("chat_rejection request_id=%s code=%s", request_id, error.detail["code"])
+    return error
+
+
+def _classify_generation_error(exc: Exception) -> HTTPException:
     """Use the same public error classification before and during a stream."""
+    if isinstance(exc, RAGGroundingError):
+        logger.warning(
+            "Chat grounding rejected reason=%s claim_index=%d citation_present=%s source_count=%d",
+            exc.reason, exc.claim_index, exc.citation_present, exc.source_count,
+        )
+        return _service_error(503, exc.code, "Chưa thể xác minh câu trả lời từ nguồn tuyển sinh hiện có.")
     _log_queued_exception("Chat generation dependency failed", exc)
     if isinstance(exc, LLMTimeoutError):
         return _service_error(504, exc.code, LLM_TIMEOUT_MESSAGE)
     if isinstance(exc, LLMAuthenticationError):
-        return _service_error(502, exc.code, LLM_UNAVAILABLE_MESSAGE)
+        return _service_error(503, exc.code, LLM_UNAVAILABLE_MESSAGE)
     if isinstance(exc, (LLMConnectionError, LLMRateLimitError)):
         return _service_error(503, exc.code, LLM_UNAVAILABLE_MESSAGE)
     if isinstance(exc, LLMProviderError):
-        return _service_error(502, exc.code, LLM_UNAVAILABLE_MESSAGE)
+        return _service_error(503, exc.code, LLM_UNAVAILABLE_MESSAGE)
     if isinstance(exc, RAGRetrievalError):
         return _service_error(503, "RAG_UNAVAILABLE", RAG_UNAVAILABLE_MESSAGE)
     return _service_error(500, "INTERNAL_ERROR", INTERNAL_ERROR_MESSAGE)
@@ -110,6 +136,10 @@ def _stream_item(item: Any) -> dict[str, Any]:
             "citations": [Citation.model_validate(c).model_dump(exclude_unset=True) for c in item["citations"]],
             "route_type": item["route_type"],
         }
+        mode = item.get("answer_mode", "generated")
+        if mode not in {"generated", "evidence"}:
+            raise TypeError("Invalid answer mode")
+        payload["answer_mode"] = mode
     else:
         raise TypeError("Invalid RAG stream event")
     json.dumps(payload, allow_nan=False)
@@ -133,12 +163,12 @@ async def _persist_answer(db: AsyncSession, session_id: str, question: str,
             await db.flush()
         db.add_all(records)
         await db.commit()
-    except Exception:
-        logger.exception("Could not persist chat messages")
+    except Exception as exc:
+        logger.error("Could not persist chat messages error_class=%s", type(exc).__name__)
         try:
             await db.rollback()
-        except Exception:
-            logger.exception("Could not roll back chat messages")
+        except Exception as exc:
+            logger.error("Could not roll back chat messages error_class=%s", type(exc).__name__)
 
 
 def initialize_rag(
@@ -192,18 +222,21 @@ def initialize_rag(
             # Dense cosine thresholds are not meaningful for RRF scores.
             min_score=None if is_injected else settings.RETRIEVAL_MIN_SCORE,
             min_lexical_coverage=settings.RETRIEVAL_MIN_LEXICAL_COVERAGE,
-            query_rewriter=QueryRewriter(llm_client),
+            query_rewriter=(
+                QueryRewriter(llm_client) if settings.QUERY_REWRITE_ENABLED else None
+            ),
             abbreviation_normalizer=AbbreviationNormalizer(),
-            reranker=Reranker(),
+            reranker=_build_evidence_selector(),
         )
         rag_manifest = loaded_manifest
         rag_initialization_error = None
         rag_public_error = None
         logger.info(
-            "RAG ready: %s documents, %s chunks, backend=%s",
+            "RAG ready: %s documents, %s chunks, backend=%s, rerank_backend=%s",
             loaded_manifest["document_count"],
             loaded_manifest["chunk_count"],
             loaded_manifest.get("retrieval_backend", loaded_manifest.get("backend")),
+            settings.RERANK_BACKEND,
         )
         return loaded_manifest
     except Exception as exc:
@@ -239,15 +272,19 @@ def rag_status() -> dict[str, Any]:
         "documents": rag_manifest.get("document_count") if rag_manifest else 0,
         "chunks": rag_manifest.get("chunk_count") if rag_manifest else 0,
         "embedding_model": rag_manifest.get("embedding_model") if rag_manifest else None,
+        "rerank_backend": settings.RERANK_BACKEND,
     }
 
 
 @router.post("")
 async def chat(
     request: ChatRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     accept: Annotated[str | None, Header()] = None,
 ):
+    request_id = uuid4().hex
+    response.headers["X-Request-ID"] = request_id
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
     chain = rag_chain
@@ -260,17 +297,22 @@ async def chat(
     history_for_rag = session_memory.get_history(session_id, max_turns=5)
 
     if _wants_json(accept):
+        def generate():
+            with generation_diagnostics(request.message, request_id):
+                return chain.answer(request.message, history_for_rag)
+
         try:
-            result = await asyncio.to_thread(chain.answer, request.message, history_for_rag)
+            result = await asyncio.to_thread(generate)
             response = ChatResponse(
                 answer=result.answer, citations=result.citations,
                 route_type=result.route_type, session_id=session_id,
+                answer_mode=getattr(result, "answer_mode", "generated"),
             )
             if not response.answer.strip():
                 raise ValueError("RAG returned an empty answer")
             json.dumps(response.model_dump(), allow_nan=False)
         except Exception as exc:
-            raise _generation_http_error(exc) from exc
+            raise _generation_http_error(exc, request_id) from exc
         await _persist_answer(db, session_id, request.message, response.answer,
                               [c.model_dump() for c in response.citations], response.route_type)
         return response
@@ -278,6 +320,10 @@ async def chat(
     q = queue.Queue()
 
     def worker():
+        with generation_diagnostics(request.message, request_id):
+            generate_stream()
+
+    def generate_stream():
         try:
             saw_text = False
             saw_metadata = False
@@ -298,7 +344,7 @@ async def chat(
     # Do not commit HTTP 200 until the first valid event is available.
     first_item = await asyncio.to_thread(q.get)
     if isinstance(first_item, Exception):
-        raise _generation_http_error(first_item) from first_item
+        raise _generation_http_error(first_item, request_id) from first_item
 
     async def async_generator():
         full_answer = ""
@@ -307,7 +353,7 @@ async def chat(
         item = first_item
         while item is not None:
             if isinstance(item, Exception):
-                error = _generation_http_error(item)
+                error = _generation_http_error(item, request_id)
                 yield f"event: error\ndata: {json.dumps(error.detail, ensure_ascii=False)}\n\n"
                 return
             if item["type"] == "metadata":
@@ -323,7 +369,8 @@ async def chat(
         await _persist_answer(db, session_id, request.message, full_answer,
                               citations_payload, route_type_payload)
 
-    return StreamingResponse(async_generator(), media_type="text/event-stream")
+    return StreamingResponse(async_generator(), media_type="text/event-stream",
+                             headers={"X-Request-ID": request_id})
 
 
 @router.post("/feedback")

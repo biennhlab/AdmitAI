@@ -21,6 +21,11 @@ from src.generation.rag_chain import (
 @pytest.fixture(autouse=True)
 def mock_cross_encoder():
     with (
+        # Explicit neural compatibility tests opt out of the supported lite profile.
+        patch.object(settings, "LOCAL_DEV_PROFILE", False),
+        patch.object(settings, "RERANK_BACKEND", "neural"),
+        patch.object(settings, "QUERY_REWRITE_ENABLED", True),
+        patch.object(settings, "MODELS_LOCAL_ONLY", False),
         patch("src.retrieval.reranker.CrossEncoder", autospec=True) as factory,
         patch("src.retrieval.reranker.snapshot_download", autospec=True) as download,
     ):
@@ -246,7 +251,7 @@ class RecordingRetriever:
 
 
 class RecordingLLM:
-    def __init__(self, answer="Supported answer [1] [2]"):
+    def __init__(self, answer="admission [1]"):
         self.answer_text = answer
         self.calls = []
 
@@ -338,7 +343,7 @@ def test_candidate_at_cap_boundary_can_win_but_next_candidate_is_never_scored(
     result = run_chain(
         RAGChain(
             RecordingRetriever(candidates),
-            RecordingLLM("Winning evidence [1]"),
+            RecordingLLM("admission [1]"),
             top_k=12,
             reranker=Reranker(),
         ),
@@ -352,6 +357,42 @@ def test_candidate_at_cap_boundary_can_win_but_next_candidate_is_never_scored(
     assert result.citations[0]["doc_id"] == "doc-10"
     assert result.citations[0]["source_url"] == "https://example.org/10"
     assert result.citations[0]["score"] == candidates[9][1]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_full_reranker_reversal_defines_prompt_and_marker_order(
+    mock_cross_encoder, monkeypatch, streaming,
+):
+    monkeypatch.setattr(settings, "RERANK_TOP_K", 3)
+    candidates = [
+        (
+            Chunk(
+                chunk_id,
+                f"admission evidence {chunk_id}",
+                {
+                    "doc_id": f"doc-{chunk_id}",
+                    "page_number": page,
+                    "source_url": f"https://example.org/{chunk_id}",
+                },
+            ),
+            score,
+        )
+        for chunk_id, page, score in [("a", 1, 0.9), ("b", 2, 0.8), ("c", 3, 0.7)]
+    ]
+    mock_cross_encoder.return_value.predict.return_value = [1.0, 2.0, 3.0]
+
+    result = run_chain(
+        RAGChain(
+            RecordingRetriever(candidates),
+            RecordingLLM("admission [1] [2] [3]"),
+            reranker=Reranker(),
+        ),
+        streaming,
+    )
+
+    assert [citation["chunk_id"] for citation in result.citations] == ["c", "b", "a"]
+    assert [citation["marker"] for citation in result.citations] == [1, 2, 3]
+    assert [citation["score"] for citation in result.citations] == [0.7, 0.8, 0.9]
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -371,7 +412,7 @@ def test_without_reranker_legacy_flow_does_not_apply_candidate_cap(monkeypatch, 
 
     with patch.object(ContextAssembler, "assemble", capture_assemble):
         run_chain(
-            RAGChain(RecordingRetriever(candidates), RecordingLLM("Evidence [1]"), top_k=15),
+            RAGChain(RecordingRetriever(candidates), RecordingLLM("admission [1]"), top_k=15),
             streaming,
         )
 
@@ -403,7 +444,7 @@ def test_coverage_hybrid_can_return_sixty_but_cross_encoder_receives_ten(
     mock_cross_encoder.return_value.predict.return_value = list(range(10))
 
     result = run_chain(
-        RAGChain(hybrid, RecordingLLM("Evidence [1]"), top_k=20, reranker=Reranker()),
+        RAGChain(hybrid, RecordingLLM("PTIT phương thức tuyển sinh năm 2026 [1]."), top_k=20, reranker=Reranker()),
         streaming,
         query,
     )
@@ -414,9 +455,10 @@ def test_coverage_hybrid_can_return_sixty_but_cross_encoder_receives_ten(
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("answer, expected_markers", [
-    ("Claim [1] and another [2]", [1, 2]),
-    ("Only second source [2] [2] [99]", [2]),
-    ("Answer without markers", [1, 2]),
+    ("admission eligibility [1]. admission tuition deadline [2].", [1, 2]),
+    ("admission tuition deadline [2] [2]", [2]),
+    ("Answer without markers", None),
+    ("admission tuition [2] [99]", None),
 ])
 def test_integration_ranking_provenance_and_citation_mapping(
     mock_cross_encoder, monkeypatch, streaming, answer, expected_markers,
@@ -455,10 +497,17 @@ def test_integration_ranking_provenance_and_citation_mapping(
         return original_assemble(self, retrieved)
 
     with patch.object(ContextAssembler, "assemble", capture_assemble):
+        if expected_markers is None:
+            from src.generation.grounding import RAGGroundingError
+            with pytest.raises(RAGGroundingError):
+                run_chain(chain, streaming, "admission tuition deadline", history)
+            assert candidates == before
+            assert len(llm.calls) == 1
+            return
         result = run_chain(chain, streaming, "admission tuition deadline", history)
 
     assert result.route_type == "general"
-    assert result.answer == answer
+    assert result.answer == answer.replace(" [1]", "").replace(" [2]", "")
     assert retriever.calls == [("admission tuition deadline", 17)]
     assert [id(c) for c, _ in assembled_inputs] == [id(chunks[1]), id(chunks[0])]
     assert candidates == before
@@ -535,15 +584,50 @@ def test_integration_missing_metadata(mock_cross_encoder, streaming, metadata):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_duplicate_content_does_not_duplicate_citations(mock_cross_encoder, streaming):
+def test_duplicate_content_from_different_sources_remains_distinct(mock_cross_encoder, streaming):
     a = Chunk("a", "admission alpha", {"doc_id": "a"})
     duplicate = Chunk("duplicate", " admission  alpha ", {"doc_id": "other"})
     b = Chunk("b", "admission beta", {"doc_id": "b"})
     candidates = [(a, 0.8), (a, 0.8), (duplicate, 0.7), (b, 0.6)]
     mock_cross_encoder.return_value.predict.return_value = [4, 4, 3, 2]
-    result = run_chain(RAGChain(RecordingRetriever(candidates), RecordingLLM(), reranker=Reranker()), streaming)
-    assert [c["chunk_id"] for c in result.citations] == ["a", "b"]
-    assert [c["marker"] for c in result.citations] == [1, 2]
+    result = run_chain(
+        RAGChain(
+            RecordingRetriever(candidates),
+            RecordingLLM("admission [1] [2] [3]"),
+            reranker=Reranker(),
+        ),
+        streaming,
+    )
+    assert [c["chunk_id"] for c in result.citations] == ["a", "duplicate", "b"]
+    assert [c["marker"] for c in result.citations] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_no_marker_after_reranker_selects_top_five_rejects_generation(
+    mock_cross_encoder, monkeypatch, streaming,
+):
+    monkeypatch.setattr(settings, "RERANK_TOP_K", 5)
+    candidates = [
+        (
+            Chunk(
+                str(index),
+                f"admission evidence {index}",
+                {"doc_id": f"doc-{index}", "page_number": index + 1},
+            ),
+            1.0 - index / 10,
+        )
+        for index in range(6)
+    ]
+    mock_cross_encoder.return_value.predict.return_value = list(range(6))
+    llm = RecordingLLM("Answer without citation markers")
+
+    from src.generation.grounding import RAGGroundingError
+    with pytest.raises(RAGGroundingError, match="citation marker"):
+        run_chain(
+            RAGChain(RecordingRetriever(candidates), llm, top_k=6, reranker=Reranker()),
+            streaming,
+        )
+    assert llm.calls[0]["system_prompt"].count('<document id="') == 5
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -647,7 +731,7 @@ def test_real_dense_bm25_fusion_pipeline_is_unchanged(mock_cross_encoder, stream
     mock_cross_encoder.return_value.predict.side_effect = lambda pairs: [
         10.0 if text == chunk_search_text(target) else -1.0 for _, text in pairs
     ]
-    result = run_chain(RAGChain(hybrid, RecordingLLM("Answer [1]"), top_k=3, reranker=Reranker()), streaming)
+    result = run_chain(RAGChain(hybrid, RecordingLLM("admission course [1]"), top_k=3, reranker=Reranker()), streaming)
     assert result.citations[0]["chunk_id"] == target.chunk_id
     assert result.citations[0]["score"] == round(original[-1][1], 6)
     assert hybrid.search("admission", top_k=3) == original
@@ -717,7 +801,7 @@ def test_equal_scores_same_document_get_stable_distinct_markers(mock_cross_encod
     snapshots = []
     for order in permutations(candidates):
         result = run_chain(RAGChain(
-            RecordingRetriever(list(order)), RecordingLLM("Evidence [1] [2] [3]"), reranker=Reranker(),
+            RecordingRetriever(list(order)), RecordingLLM("admission course [1] [2] [3]"), reranker=Reranker(),
         ), streaming)
         snapshots.append(result.citations)
     assert all(snapshot == snapshots[0] for snapshot in snapshots)
@@ -758,7 +842,8 @@ async def test_api_stream_reports_reranking_failure_safely(mock_cross_encoder, i
     )
     # Reranking fails before the first event, so the HTTP status is still mutable.
     with pytest.raises(HTTPException) as caught:
-        await chat.chat(ChatRequest(message="admission"), db=MagicMock())
+        from fastapi import Response
+        await chat.chat(ChatRequest(message="admission"), response=Response(), db=MagicMock())
     assert caught.value.status_code == 503
     assert caught.value.detail["code"] == "RAG_UNAVAILABLE"
     assert "private model secret" not in str(caught.value.detail)

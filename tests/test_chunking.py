@@ -314,6 +314,50 @@ def test_combined_ids_are_deterministic_for_children_tables_and_parents() -> Non
     assert [chunk.chunk_id for chunk in parents_one] == [chunk.chunk_id for chunk in parents_two]
 
 
+def test_combined_preserves_identical_text_on_different_pages_and_parent_links() -> None:
+    repeated = "Repeated admission evidence with the same wording."
+    parents: list[Chunk] = []
+
+    chunks = combined_chunk(
+        [page(repeated, number=1), page(repeated, number=2)],
+        metadata=BASE_METADATA,
+        parent_chunks=parents,
+    )
+
+    repeated_chunks = [chunk for chunk in chunks if repeated in chunk.content]
+    assert [chunk.metadata["page_number"] for chunk in repeated_chunks] == [1, 2]
+    assert len({chunk.chunk_id for chunk in repeated_chunks}) == 2
+    parent_by_id = {parent.chunk_id: parent for parent in parents}
+    for chunk in repeated_chunks:
+        parent = parent_by_id[chunk.metadata["parent_chunk_id"]]
+        assert chunk.chunk_id in parent.metadata["child_chunk_ids"]
+        assert parent.metadata["child_count"] == len(parent.metadata["child_chunk_ids"])
+
+
+def test_combined_preserves_identical_tables_on_different_pages() -> None:
+    rows = [["Campus", "Quota"], ["BVS", "300"]]
+    parents: list[Chunk] = []
+
+    chunks = combined_chunk(
+        [
+            page(number=4, tables=[Table(rows, 4)]),
+            page(number=7, tables=[Table(rows, 7)]),
+        ],
+        metadata=BASE_METADATA,
+        parent_chunks=parents,
+    )
+
+    tables = [chunk for chunk in chunks if chunk.metadata["chunk_type"] == "table"]
+    assert [chunk.metadata["page_number"] for chunk in tables] == [4, 7]
+    assert len({chunk.chunk_id for chunk in tables}) == 2
+    assert all("| Campus | Quota |" in chunk.content for chunk in tables)
+    parent_by_id = {parent.chunk_id: parent for parent in parents}
+    assert all(
+        table.chunk_id in parent_by_id[table.metadata["parent_chunk_id"]].metadata["child_chunk_ids"]
+        for table in tables
+    )
+
+
 def test_size_validation_rejects_invalid_advanced_configuration() -> None:
     with pytest.raises(ValueError, match="max_size"):
         structure_aware_chunk([page("text")], max_size=0)

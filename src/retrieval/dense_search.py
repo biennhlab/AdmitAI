@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import uuid
 from collections.abc import Mapping
 from numbers import Real
 from typing import Any, List, Optional, Tuple
@@ -11,6 +10,7 @@ from qdrant_client import models
 
 from src.ingestion.chunker import Chunk
 from src.retrieval.embedder import Embedder
+from src.qdrant_integrity import expected_payload, point_id
 
 
 from src.retrieval.document import chunk_search_text
@@ -104,7 +104,6 @@ class NaiveDenseSearch:
         return results[:actual_top_k]
 
 
-_POINT_ID_NAMESPACE = uuid.UUID("260f54e7-d506-4f94-a0ac-b6eac955ff1b")
 _PAYLOAD_RESERVED_KEYS = {"chunk_id", "content", "metadata"}
 
 
@@ -123,10 +122,7 @@ class QdrantDenseSearch:
     @staticmethod
     def _point_id(chunk_id: str) -> str:
         """Use a native UUID as-is, otherwise derive a stable UUID from chunk_id."""
-        try:
-            return str(uuid.UUID(chunk_id))
-        except (ValueError, TypeError, AttributeError):
-            return str(uuid.uuid5(_POINT_ID_NAMESPACE, chunk_id))
+        return point_id(chunk_id)
 
     @staticmethod
     def _json_compatible(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -247,15 +243,7 @@ class QdrantDenseSearch:
 
         points: list[models.PointStruct] = []
         for chunk, vector in zip(chunks, matrix, strict=True):
-            metadata = self._json_compatible(chunk.metadata)
-            payload = {
-                **metadata,
-                "chunk_id": chunk.chunk_id,
-                "content": chunk.content,
-                # A nested copy makes reconstruction lossless while root fields
-                # remain directly filterable by Qdrant.
-                "metadata": metadata,
-            }
+            payload = expected_payload({"chunk_id": chunk.chunk_id, "content": chunk.content, "metadata": chunk.metadata})
             points.append(
                 models.PointStruct(
                     id=self._point_id(chunk.chunk_id),

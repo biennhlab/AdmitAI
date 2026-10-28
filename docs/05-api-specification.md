@@ -83,7 +83,8 @@ không có evidence (`out_of_scope`); thứ tự citation và marker khớp cont
 **Errors**:
 - Request thiếu/sai kiểu field: HTTP `422`; message rỗng: HTTP `400`.
 - RAG chưa sẵn sàng hoặc retrieval/reranking lỗi trước event đầu tiên: HTTP `503`.
-- LLM timeout: `504`; authentication/provider error: `502`; connection/rate limit: `503`.
+- LLM timeout: `504`; authentication/provider, connection/rate limit và câu trả lời chưa xác minh được: `503`, giữ mã lỗi riêng. Luồng chat không phát `502`.
+- Khi provider gián đoạn hoặc model thiếu citation, chỉ câu hỏi tổng quan phương thức PTIT có bộ nguồn đầy đủ, cùng scope và qua validator mới trả `200` với `answer_mode="evidence"`. Với output thiếu citation, bỏ toàn bộ output đó và tạo câu trả lời độc lập từ nguồn; không đoán marker cho claim chưa được trích dẫn. Câu trả lời bình thường có `answer_mode="generated"`; JSON và metadata SSE dùng cùng trường này. Không có thêm lượt gọi LLM để sửa câu trả lời.
 - Exception không dự kiến hoặc output dependency sai cấu trúc: `500`.
 - Trước event đầu tiên (và trong chế độ JSON), lỗi dùng JSON
   `{"detail":{"code":"...","message":"..."}}`.

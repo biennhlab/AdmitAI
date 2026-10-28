@@ -83,7 +83,7 @@ def test_rewriter_returns_clearer_query_and_uses_existing_client_contract():
     assert kwargs["messages"][0]["role"] == "user"
 
 
-def test_rewriter_logs_the_rewritten_query(caplog):
+def test_rewriter_logs_completion_without_private_query(caplog):
     llm = MagicMock()
     rewritten = "Điểm chuẩn ngành CNTT của PTIT năm 2024 là bao nhiêu?"
     llm.generate.return_value = rewritten
@@ -91,7 +91,8 @@ def test_rewriter_logs_the_rewritten_query(caplog):
     with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         QueryRewriter(llm).rewrite("Điểm chuẩn CNTT PTIT 2024?")
 
-    assert f"Rewritten query: {rewritten}" in caplog.messages
+    assert "Query rewrite completed" in caplog.messages
+    assert rewritten not in caplog.text
 
 
 @pytest.mark.parametrize("output", ["", "   ", None])

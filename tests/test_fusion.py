@@ -385,3 +385,87 @@ def test_search_expansion_labels_do_not_mutate_corpus_or_previous_results() -> N
     assert narrow[0][0].metadata["expansion_type"] == "exact"
     assert coverage == coverage_before
     assert sparse.chunks == corpus_before
+
+
+def test_weighted_rrf_branch_union_unique_ranks_and_exact_ids():
+    dense = [("CN1", 0.9), ("CN1", 0.8), ("CN10", 0.7), ("shared", 0.6)]
+    sparse = [("shared", 10), ("sparse-only", 9)]
+    result = reciprocal_rank_fusion([dense, sparse], weights=(1, 2))
+    assert dict(result) == pytest.approx({
+        "CN1": 1 / 61, "CN10": 1 / 62,
+        "shared": 1 / 63 + 2 / 61, "sparse-only": 2 / 62,
+    })
+    assert result[0][0] == "shared"
+    assert reciprocal_rank_fusion([dense, sparse]) == reciprocal_rank_fusion([dense, sparse], weights=(1, 1))
+    assert dict(reciprocal_rank_fusion([dense, sparse], weights=(0, 2)))["CN1"] == 0
+
+
+@pytest.mark.parametrize("weights,error", [
+    ((0, 0), ValueError), ((-1, 1), ValueError), ((float('nan'), 1), ValueError),
+    ((float('inf'), 1), ValueError), ((True, 1), TypeError), (("1", 1), TypeError),
+    ((1,), ValueError),
+])
+def test_weighted_rrf_rejects_invalid_weights(weights, error):
+    with pytest.raises(error):
+        reciprocal_rank_fusion([[("a", 1)], []], weights=weights)
+
+
+def test_weighted_rrf_sparse_only_and_ties():
+    assert reciprocal_rank_fusion([[], [("a", 1)]], weights=(1, 2)) == [("a", 2 / 61)]
+    assert reciprocal_rank_fusion([[("b", 1)], [("a", 1)]], weights=(2, 2)) == [("a", 2 / 61), ("b", 2 / 61)]
+
+
+def test_candidate_stage_does_not_hydrate_or_drop_ids():
+    child = chunk("child", metadata={"doc_id": "doc", "parent_chunk_id": "parent", "chunk_type": "child"})
+    parent = chunk("parent", metadata={"doc_id": "doc", "chunk_type": "parent"})
+    retriever = HybridRetriever(StubRetriever([(child, 1)]), StubRetriever([]), [asdict(parent)])
+    assert retriever.search_candidates("query", 1)[0][0] is child
+    assert ids(retriever.search("query", 1)) == ["parent"]
+
+
+@pytest.mark.parametrize("kind", ["neighbor", "table", "parent"])
+def test_lite_expansion_filters_wrong_year_campus_and_doc(kind):
+    from src.retrieval.domain_signals import QueryScope, expansion_allowed
+
+    metadata = {"doc_id": "doc", "admission_year": "2031", "campus": "BVH", "heading_path": ["Điểm chuẩn"], "chunk_index": 1}
+    seed = chunk("seed", metadata=metadata)
+    allowed = chunk("allowed", metadata={**metadata, "chunk_index": 2})
+    wrong = chunk("wrong", metadata={**metadata, "chunk_index": 0, "campus": "BVS"})
+    if kind == "table":
+        for part, index in ((seed, 0), (allowed, 1), (wrong, 2)):
+            part.metadata.update(table_index=1, table_part=index, chunk_type="table")
+    parents = []
+    if kind == "parent":
+        seed.metadata.update(parent_chunk_id="wrong", chunk_type="child")
+        wrong.metadata["chunk_type"] = "parent"
+        parents = [asdict(wrong)]
+    sparse = StubRetriever([])
+    sparse.chunks = [seed, allowed, wrong]
+    hybrid = HybridRetriever(StubRetriever([]), sparse, parents)
+    scope = QueryScope.parse("Các điểm chuẩn BVH 2031")
+    expanded = hybrid.expand("các điểm chuẩn", [(seed, .02)], top_k=5, scope_guard=lambda a, b: expansion_allowed(scope, a, b))
+    assert "seed" in ids(expanded)
+    assert "wrong" not in ids(expanded)
+    if kind != "parent":
+        assert "allowed" in ids(expanded)
+
+
+def test_lite_expansion_preserves_seed_rank_before_table_siblings():
+    from src.retrieval.domain_signals import QueryScope, expansion_allowed
+    metadata = {"doc_id": "d", "admission_year": "2031", "table_index": 0, "chunk_type": "table"}
+    parts = [chunk(f"part-{i}", metadata={**metadata, "table_part": i}) for i in range(5)]
+    sparse = StubRetriever([])
+    sparse.chunks = parts
+    hybrid = HybridRetriever(StubRetriever([]), sparse)
+    scope = QueryScope.parse("Các ngành 2031")
+    results = hybrid.expand("các ngành", [(parts[4], .02), (parts[2], .01)], top_k=2, scope_guard=lambda a, b: expansion_allowed(scope, a, b))
+    assert ids(results)[:2] == ["part-4", "part-2"]
+    assert [score for _, score in results[:2]] == [.02, .01]
+
+
+def test_lite_wide_candidate_branch_requests_remain_bounded():
+    dense, sparse = StubRetriever([]), StubRetriever([])
+    retriever = HybridRetriever(dense, sparse)
+    retriever.search_candidates("các ngành", top_k=1000, candidate_limit=360)
+    assert dense.calls[-1] == ("các ngành", 360)
+    assert sparse.calls[-1] == ("các ngành", 360)

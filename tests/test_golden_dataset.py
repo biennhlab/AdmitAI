@@ -1,4 +1,5 @@
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +19,11 @@ def golden_dataset():
 
 def test_checked_in_golden_dataset_schema(golden_dataset):
     assert validate_dataset(golden_dataset) == []
+
+
+def test_golden_validation_defaults_to_the_supported_current_manifest():
+    from src.local_profile import LOCAL_INDEX_DIR
+    assert DEFAULT_MANIFEST == Path(__file__).resolve().parents[1] / LOCAL_INDEX_DIR / "manifest.json"
 
 
 def test_golden_evidence_matches_local_index(golden_dataset):

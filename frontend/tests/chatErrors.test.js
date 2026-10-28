@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { parseChatStream } from '@/lib/chatErrors.mjs';
+import { friendlyChatError, marksServiceUnavailable, parseChatResponse, parseChatStream } from '@/lib/chatErrors.mjs';
 
 function streamResponse(parts, cancel = vi.fn()) {
   const encoder = new TextEncoder();
@@ -17,6 +17,33 @@ function streamResponse(parts, cancel = vi.fn()) {
 }
 
 describe('chat SSE parsing', () => {
+  it.each([parseChatResponse, parseChatStream])('keeps a safe request ID with the structured API rejection', async (parse) => {
+    const id = '1234567890abcdef1234567890abcdef';
+    const response = Response.json({ detail: { code: 'GENERATION_UNGROUNDED' } }, {
+      status: 502, headers: { 'x-request-id': id }
+    });
+    await expect(parse(response)).rejects.toMatchObject({ code: 'GENERATION_UNGROUNDED', status: 502, requestId: id });
+  });
+  it('explains unsupported generation without marking retrieval unavailable', () => {
+    const error = { code: 'GENERATION_UNGROUNDED' };
+    expect(friendlyChatError(error)).toContain('chưa thể xác minh');
+    expect(marksServiceUnavailable(error)).toBe(false);
+  });
+
+  it('handles a grounding SSE rejection without displaying answer chunks', async () => {
+    const onChunk = vi.fn();
+    const onMetadata = vi.fn();
+    const response = streamResponse([
+      'event: error\ndata: {"code":"GENERATION_UNGROUNDED","message":"Cannot verify"}\n\n'
+    ]);
+
+    await expect(parseChatStream(response, onChunk, onMetadata)).rejects.toMatchObject({
+      code: 'GENERATION_UNGROUNDED'
+    });
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onMetadata).not.toHaveBeenCalled();
+    expect(response.body.locked).toBe(false);
+  });
   it('preserves split UTF-8 chunks and metadata on the final line', async () => {
     const encodedChunk = new TextEncoder().encode('data: {"type":"chunk","text":"Học phí"}\r\n\r\n');
     const metadata = { type: 'metadata', session_id: 'session-1', citations: [] };

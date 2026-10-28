@@ -26,6 +26,7 @@ class ChatResponse(BaseModel):
     citations: List[Citation] = Field(default_factory=list)
     route_type: Optional[str] = None
     session_id: str
+    answer_mode: Literal["generated", "evidence"] = "generated"
 
 class FeedbackRequest(BaseModel):
     message_id: int

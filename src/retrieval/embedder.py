@@ -45,7 +45,16 @@ class Embedder:
             # Some transformers releases surface an incomplete local snapshot
             # as AttributeError rather than OSError. In that case, let the
             # normal Hugging Face resolution path repair/download the model.
-            except (OSError, ValueError, AttributeError):
+            except (OSError, ValueError, AttributeError) as exc:
+                from src.runtime_resources import failure_code
+                if failure_code(exc, "rag") == "INSUFFICIENT_MEMORY":
+                    raise
+                if settings.MODELS_LOCAL_ONLY:
+                    from src.runtime_resources import StartupCheckError
+                    raise StartupCheckError(
+                        "MODEL_UNAVAILABLE",
+                        "BGE-M3 is unavailable in the local model cache. Restore the complete local snapshot; automatic downloads are disabled.",
+                    )
                 token = settings.HF_TOKEN
                 model = SentenceTransformer(
                     model_name,

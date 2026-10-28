@@ -13,7 +13,8 @@ from openai import (
     RateLimitError,
 )
 
-from api.main import app, health_check, startup_event
+from api.main import app, health_check, load_local_index, startup_event
+from api.main import load_hybrid_retriever as build_hybrid_retriever
 from api.routers import chat
 from src.database.connection import get_db
 from src.generation.llm_client import (
@@ -26,6 +27,26 @@ from src.generation.llm_client import (
 from src.generation.rag_chain import RAGChain, RAGResponse
 from src.generation.session_memory import SessionMemory
 from api.schemas import ChatResponse
+from src.retrieval.index_version import INDEX_BUILD_REVISION, index_build_fingerprint
+
+
+def _current_index_manifest(collection: str) -> dict:
+    return {
+        "module": 3,
+        "embedding_model": chat.settings.EMBEDDING_MODEL,
+        "qdrant_collection": collection,
+        "corpus_fingerprint": "corpus",
+        "index_build_revision": INDEX_BUILD_REVISION,
+        "build_fingerprint": index_build_fingerprint(
+            3,
+            embedding_model=chat.settings.EMBEDDING_MODEL,
+            chunk_size=chat.settings.CHUNK_SIZE,
+            chunk_overlap=chat.settings.CHUNK_OVERLAP,
+            table_chunk_size=chat.settings.TABLE_CHUNK_SIZE,
+            parent_chunk_size=chat.settings.PARENT_CHUNK_SIZE,
+            child_chunk_size=chat.settings.CHILD_CHUNK_SIZE,
+        ),
+    }
 
 
 class FakeDB:
@@ -91,6 +112,7 @@ def mock_reranker_model():
 
 @pytest.fixture(autouse=True)
 def restore_chat_state(monkeypatch):
+    monkeypatch.setattr(app.state, "rag_recovery", {"blocked": False, "error_code": None, "retry_at": 0.0})
     original_chain = chat.rag_chain
     original_manifest = chat.rag_manifest
     original_internal_error = chat.rag_initialization_error
@@ -151,6 +173,38 @@ async def request(method: str, path: str, *, json=None, db=None, headers=None):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.request(method, path, json=json, headers=headers)
+
+
+def test_m1_runtime_rejects_pre_revision_manifest():
+    manifest = {
+        "module": 3,
+        "embedding_model": chat.settings.EMBEDDING_MODEL,
+        "qdrant_collection": chat.settings.QDRANT_COLLECTION,
+        "corpus_fingerprint": "legacy-corpus",
+    }
+
+    with patch("api.main.load_dense_index", return_value=([], object(), manifest)):
+        with pytest.raises(RuntimeError, match="index_build_revision_missing"):
+            load_local_index()
+
+
+@pytest.mark.asyncio
+async def test_startup_rejects_manifest_for_different_qdrant_collection(monkeypatch):
+    manifest = _current_index_manifest("other_collection")
+    monkeypatch.setattr("api.main.load_local_index", load_local_index)
+
+    with (
+        patch("api.main.init_db", new=AsyncMock()),
+        patch("api.main.load_dense_index", return_value=([], object(), manifest)),
+        patch("api.main._llm_is_configured", return_value=True),
+    ):
+        await startup_event()
+
+    payload = await health_check()
+    assert payload["status"] == "degraded"
+    assert payload["components"]["local_index"]["ready"] is False
+    assert payload["components"]["qdrant"]["ready"] is False
+    assert payload["components"]["rag"]["ready"] is False
 
 
 def stream_events(response):
@@ -252,8 +306,8 @@ async def test_health_detects_qdrant_failure_after_startup():
     qdrant = MagicMock()
     qdrant.collection_exists.side_effect = ConnectionError("connection reset")
     app.state.qdrant_client = qdrant
-    app.state.components["local_index"]["chunks"] = 3178
-    app.state.components["qdrant"] = {"ready": True, "chunks": 3178}
+    app.state.components["local_index"]["chunks"] = 3185
+    app.state.components["qdrant"] = {"ready": True, "chunks": 3185}
     chat.rag_chain = object()
     chat.rag_manifest = {"embedding_model": "BAAI/bge-m3"}
 
@@ -349,7 +403,7 @@ async def test_chat_returns_public_503_when_rag_is_unavailable():
     ("error", "expected_status", "expected_code"),
     [
         (LLMTimeoutError("provider secret"), 504, "LLM_TIMEOUT"),
-        (LLMAuthenticationError("provider secret"), 502, "LLM_AUTHENTICATION_FAILED"),
+        (LLMAuthenticationError("provider secret"), 503, "LLM_AUTHENTICATION_FAILED"),
         (LLMConnectionError("provider secret"), 503, "LLM_UNAVAILABLE"),
         (LLMRateLimitError("provider secret"), 503, "LLM_RATE_LIMITED"),
     ],
@@ -442,7 +496,7 @@ def test_llm_client_classifies_openai_compatible_errors(sdk_error_type, domain_e
         )
 
 
-def test_queued_exception_logging_preserves_traceback(caplog):
+def test_queued_exception_logging_keeps_class_without_private_payload(caplog):
     try:
         raise TypeError("legacy SDK rejected a keyword")
     except TypeError as exc:
@@ -451,7 +505,8 @@ def test_queued_exception_logging_preserves_traceback(caplog):
     chat._log_queued_exception("Chat generation failed at the provider", queued_exception)
 
     assert "Chat generation failed at the provider" in caplog.text
-    assert "TypeError: legacy SDK rejected a keyword" in caplog.text
+    assert "error_class=TypeError" in caplog.text
+    assert "legacy SDK rejected a keyword" not in caplog.text
     assert "NoneType: None" not in caplog.text
 
 
@@ -547,10 +602,10 @@ async def test_unknown_session_and_extra_request_field_keep_existing_behavior(ac
 
 ERROR_CASES = [
     (LLMTimeoutError, 504, "LLM_TIMEOUT"),
-    (LLMAuthenticationError, 502, "LLM_AUTHENTICATION_FAILED"),
+    (LLMAuthenticationError, 503, "LLM_AUTHENTICATION_FAILED"),
     (LLMConnectionError, 503, "LLM_UNAVAILABLE"),
     (LLMRateLimitError, 503, "LLM_RATE_LIMITED"),
-    (chat.LLMProviderError, 502, "LLM_PROVIDER_ERROR"),
+    (chat.LLMProviderError, 503, "LLM_PROVIDER_ERROR"),
     (chat.RAGRetrievalError, 503, "RAG_UNAVAILABLE"),
     (ValueError, 500, "INTERNAL_ERROR"),
 ]
@@ -570,7 +625,8 @@ async def test_pre_response_errors_preserve_status_code_and_cause(accept, error_
     assert set(response.json()["detail"]) == {"code", "message"}
     assert response.json()["detail"]["code"] == code
     assert "private dependency details" not in response.text
-    assert any(record.exc_info and record.exc_info[1] is error for record in caplog.records)
+    assert any(f"error_class={error_type.__name__}" in record.message for record in caplog.records)
+    assert "private dependency details" not in caplog.text
     assert not db.commit_called
     assert all(not history for history in chat.session_memory.sessions.values())
 
@@ -594,6 +650,43 @@ async def test_midstream_errors_are_sse_and_do_not_persist_partial_answer(error_
     assert "private dependency details" not in response.text
     assert db.records == []
     assert all(not history for history in chat.session_memory.sessions.values())
+
+
+@pytest.mark.asyncio
+async def test_upstream_read_timeout_midstream_is_sse_timeout_and_does_not_persist():
+    class ReadTimeoutStream:
+        def __iter__(self):
+            yield SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="partial answer"))]
+            )
+            raise httpx.ReadTimeout("private upstream detail")
+
+    sdk = MagicMock()
+    sdk.chat.completions.create.return_value = ReadTimeoutStream()
+    with patch("src.generation.llm_client.OpenAI", return_value=sdk):
+        client = LLMClient(api_key="test", model="test", base_url="https://provider.invalid")
+
+    class ClientBackedRAG:
+        def answer_stream(self, question, history):
+            for text in client.generate_stream("system", []):
+                yield {"type": "chunk", "text": text}
+            yield {"type": "metadata", "citations": [], "route_type": "general"}
+
+    chat.rag_chain = ClientBackedRAG()
+    db = FakeDB()
+    response = await request(
+        "POST", "/api/chat", json={"message": "question"}, db=db,
+        headers={"Accept": "text/event-stream"},
+    )
+
+    events = stream_events(response)
+    assert events == [
+        ("message", {"type": "chunk", "text": "partial answer"}),
+        ("error", {"code": "LLM_TIMEOUT", "message": chat.LLM_TIMEOUT_MESSAGE}),
+    ]
+    assert "private upstream detail" not in response.text
+    assert db.records == []
+    assert not db.commit_called
 
 
 @pytest.mark.asyncio
@@ -717,3 +810,479 @@ async def test_api_to_real_rag_reranker_assembler_preserves_evidence(accept, ena
         mock_reranker_model.return_value.predict.assert_called_once()
     else:
         mock_reranker_model.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["python", "windows1455", "allocator"])
+async def test_health_never_reloads_models_after_memory_failure(kind):
+    from qdrant_client import models
+    error = MemoryError("allocation failed")
+    if kind == "windows1455":
+        error = OSError("native allocation failed")
+        error.winerror = 1455
+    elif kind == "allocator":
+        error = RuntimeError("DefaultCPUAllocator: not enough memory")
+    manifest = _current_index_manifest(chat.settings.QDRANT_COLLECTION)
+    manifest.update(document_count=1, chunk_count=0, embedding_dimension=1024)
+    with (
+        patch("api.main.init_db", new=AsyncMock()),
+        patch("api.main.load_local_index", return_value=([], manifest)),
+        patch("api.main.load_hybrid_retriever", side_effect=build_hybrid_retriever) as loader,
+        patch("api.main.QdrantClient") as client_factory,
+        patch("src.retrieval.embedder.SentenceTransformer", side_effect=error) as model_factory,
+    ):
+        client_factory.return_value.count.return_value.count = 0
+        vectors = SimpleNamespace(size=1024, distance=models.Distance.COSINE)
+        client_factory.return_value.get_collection.return_value = SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=vectors)))
+        client_factory.return_value.scroll.return_value = ([], None)
+        await startup_event()
+        for _ in range(3):
+            payload = await health_check()
+    assert loader.call_count == 1
+    model_factory.assert_called_once()
+    client_factory.return_value.close.assert_called_once()
+    assert payload["runtime"]["startup_error_code"] == "INSUFFICIENT_MEMORY"
+    assert payload["runtime"]["recovery_blocked"] is True
+    assert payload["components"]["rag"]["ready"] is False
+
+
+@pytest.mark.parametrize("memory", [
+    {"available_physical_gib": 0.01, "commit_headroom_gib": 0.01}, None,
+])
+def test_hybrid_initializes_sentence_transformer_despite_low_or_unknown_memory(memory):
+    manifest = _current_index_manifest(chat.settings.QDRANT_COLLECTION)
+    manifest["embedding_dimension"] = 1024
+    with (
+        patch("src.runtime_resources.memory_status", return_value=memory),
+        patch("api.main.QdrantClient") as client_factory,
+        patch("api.main.QdrantDenseSearch") as dense_factory,
+        patch("api.main.BM25Search"),
+        patch("src.retrieval.embedder.SentenceTransformer") as model_factory,
+    ):
+        client = client_factory.return_value
+        client.count.return_value.count = 0
+        client.scroll.return_value = ([], None)
+        model_factory.return_value.get_sentence_embedding_dimension.return_value = 1024
+        result_client, _, result_manifest = build_hybrid_retriever([], manifest)
+    model_factory.assert_called_once_with(
+        chat.settings.EMBEDDING_MODEL,
+        cache_folder=chat.settings.HUGGINGFACE_CACHE_DIR,
+        local_files_only=True,
+    )
+    dense_factory.return_value.validate_ready.assert_called_once_with(1024)
+    assert result_client is client
+    assert result_manifest is manifest
+    client.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_health_recovery_transient_failure_has_cooldown():
+    app.state.qdrant_client = None
+    app.state.components["qdrant"] = {"ready": False}
+    with patch("api.main.load_hybrid_retriever", side_effect=ConnectionError("offline")) as loader:
+        await health_check()
+        await health_check()
+        await health_check()
+    assert loader.call_count == 1
+    assert app.state.rag_recovery["blocked"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
+async def test_lite_rejects_ungrounded_generated_figures_before_any_transport_output(accept):
+    from src.ingestion.chunker import Chunk
+    from src.retrieval.lite_selector import LiteEvidenceSelector
+    retriever = MagicMock()
+    retriever.search.return_value = [(Chunk("sat", "Điểm SAT tối thiểu là 1130/1600.", {"doc_id": "d", "page_number": 1}), .02)]
+    llm = MagicMock()
+    llm.generate.return_value = "Điểm SAT tối thiểu là 9999 [1]."
+    llm.generate_stream.return_value = iter(["Điểm SAT tối thiểu là ", "9999 [1]."])
+    chat.rag_chain = RAGChain(retriever, llm, min_lexical_coverage=0, reranker=LiteEvidenceSelector())
+    response = await request("POST", "/api/chat", json={"message": "Điểm SAT tối thiểu?"}, headers={"Accept": accept})
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "GENERATION_UNGROUNDED"
+    assert "9999" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
+@pytest.mark.parametrize("answer", [
+    "Điểm SAT tối thiểu\nlà 1130/1600 [1].",
+    "## Điều kiện xét tuyển\n\n- Điểm SAT tối thiểu\n  1130/1600 [1].",
+    "| Phương thức | Điểm |\n| --- | --- |\n| SAT | 1130/1600 [1] |",
+])
+async def test_lite_markdown_preserves_answer_and_source_mapping_in_json_and_sse(accept, answer):
+    from src.ingestion.chunker import Chunk
+    from src.retrieval.lite_selector import LiteEvidenceSelector
+
+    retriever = MagicMock()
+    retriever.search.return_value = [(Chunk("sat", "Điểm SAT tối thiểu là 1130/1600.",
+        {"doc_id": "admission", "page_number": 7, "source_url": "https://example.test/admission"}), .02)]
+    llm = MagicMock()
+    llm.generate.return_value = answer
+    llm.generate_stream.return_value = iter(answer[i:i + 11] for i in range(0, len(answer), 11))
+    chat.rag_chain = RAGChain(retriever, llm, min_lexical_coverage=0, reranker=LiteEvidenceSelector())
+    response = await request("POST", "/api/chat", json={"message": "Điểm SAT tối thiểu?"}, headers={"Accept": accept})
+    assert response.status_code == 200
+    payload = response_payload(response, accept)
+    assert payload["answer"] == answer.replace(" [1]", "").replace(" [2]", "")
+    citation = payload["citations"][0]
+    assert citation["marker"] == 1
+    assert citation["chunk_id"] == "sat"
+    assert citation["doc_id"] == "admission"
+    assert citation["page"] == 7
+    assert citation["source_url"] == "https://example.test/admission"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
+@pytest.mark.parametrize("answer", [
+    "Điểm SAT 1130 [99].",
+    "Điểm SAT 1130.\n\nĐiểm SAT 1130 [1].",
+    "- Điểm SAT 1130\n- Điểm SAT 1130 [1].",
+    "| SAT | 1130 |\n| SAT | 1130 [1] |",
+])
+async def test_lite_rejection_exposes_no_unvalidated_text_or_partial_persistence(accept, answer):
+    from src.ingestion.chunker import Chunk
+    from src.retrieval.lite_selector import LiteEvidenceSelector
+
+    retriever, llm, db = MagicMock(), MagicMock(), FakeDB()
+    retriever.search.return_value = [(Chunk("sat", "Điểm SAT tối thiểu là 1130/1600.", {"doc_id": "d"}), .02)]
+    llm.generate.return_value = answer
+    llm.generate_stream.return_value = iter([answer[:12], answer[12:]])
+    chat.rag_chain = RAGChain(retriever, llm, min_lexical_coverage=0, reranker=LiteEvidenceSelector())
+    response = await request("POST", "/api/chat", json={"message": "Điểm SAT?"}, db=db, headers={"Accept": accept})
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "GENERATION_UNGROUNDED"
+    assert "1130" not in response.text
+    assert not db.commit_called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
+@pytest.mark.parametrize("supported", [True, False])
+@pytest.mark.parametrize("content,question,correct,swapped", [
+    ("Học phí đại trà 35,9 triệu/năm. Học phí chất lượng cao 58,3 triệu/năm.",
+     "Học phí đại trà?", "Học phí đại trà 35,9 triệu/năm [1].", "Học phí đại trà 58,3 triệu/năm [1]."),
+    ("Điểm SAT tối thiểu 1130/1600 hoặc ACT tối thiểu 25/36.",
+     "Điểm SAT tối thiểu?", "Điểm SAT tối thiểu 1130/1600 [1].", "Điểm SAT tối thiểu 25/36 [1]."),
+    ("Học phí đại trà năm 2025 là 35,9 triệu. Học phí đại trà năm 2026 là 40,7 triệu.",
+     "Học phí đại trà?", "Học phí đại trà năm 2026 là 40,7 triệu [1].", "Học phí đại trà năm 2026 là 35,9 triệu [1]."),
+])
+async def test_relational_grounding_accepts_supported_and_blocks_swapped_json_sse(
+    accept, supported, content, question, correct, swapped,
+):
+    from src.ingestion.chunker import Chunk
+    from src.retrieval.lite_selector import LiteEvidenceSelector
+
+    retriever, llm, db = MagicMock(), MagicMock(), FakeDB()
+    retriever.search.return_value = [(Chunk("relation", content, {"doc_id": "relation-doc"}), .02)]
+    answer = correct if supported else swapped
+    llm.generate.return_value = answer
+    llm.generate_stream.return_value = iter([answer])
+    chat.rag_chain = RAGChain(retriever, llm, min_lexical_coverage=0, reranker=LiteEvidenceSelector())
+    response = await request("POST", "/api/chat", json={"message": question}, db=db, headers={"Accept": accept})
+    if supported:
+        assert response.status_code == 200
+        payload = response_payload(response, accept)
+        assert payload["answer"] == correct.replace(" [1]", "")
+        assert payload["citations"][0]["chunk_id"] == "relation"
+        assert payload["citations"][0]["marker"] == 1
+    else:
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "GENERATION_UNGROUNDED"
+        assert swapped not in response.text
+        assert not db.commit_called
+
+
+def _abstention_chain(output):
+    from src.ingestion.chunker import Chunk
+    from src.retrieval.lite_selector import LiteEvidenceSelector
+
+    retriever, llm = MagicMock(), MagicMock()
+    retriever.search.return_value = [(Chunk("sat", "Điểm SAT tối thiểu 1130/1600.", {"doc_id": "admission"}), .02)]
+    llm.generate.return_value = output
+    chain = RAGChain(retriever, llm, min_lexical_coverage=0, reranker=LiteEvidenceSelector())
+    return chain, llm
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
+async def test_audit_f02_canonical_abstention_is_successful_and_persists_session(accept):
+    from src.database.models import ChatMessage, ChatSession
+    from src.generation.rag_chain import FALLBACK_ANSWER
+
+    chain, llm = _abstention_chain(FALLBACK_ANSWER)
+    chat.rag_chain = chain
+    db = FakeDB()
+    session_id = None
+    for turn in range(2):
+        body = {"message": "Điểm SAT tối thiểu?"}
+        if session_id:
+            body["session_id"] = session_id
+        response = await request("POST", "/api/chat", json=body, db=db, headers={"Accept": accept})
+        assert response.status_code == 200, response.text
+        assert "event: error" not in response.text
+        payload = response_payload(response, accept)
+        assert payload["answer"] == FALLBACK_ANSWER
+        assert payload["route_type"] == "out_of_scope"
+        assert payload["citations"] == []
+        assert session_id is None or payload["session_id"] == session_id
+        session_id = payload["session_id"]
+        assert llm.generate.call_count == turn + 1
+        llm.generate_stream.assert_not_called()
+    assert len([r for r in db.records if isinstance(r, ChatSession)]) == 1
+    messages = [r for r in db.records if isinstance(r, ChatMessage)]
+    assert [r.role for r in messages] == ["user", "assistant", "user", "assistant"]
+    assert all(r.content == FALLBACK_ANSWER and r.citations == [] and r.route_type == "out_of_scope"
+               for r in messages if r.role == "assistant")
+    assert chat.session_memory.get_history(session_id) == [
+        {"role": "user", "content": "Điểm SAT tối thiểu?"},
+        {"role": "assistant", "content": FALLBACK_ANSWER},
+        {"role": "user", "content": "Điểm SAT tối thiểu?"},
+        {"role": "assistant", "content": FALLBACK_ANSWER},
+    ]
+    assert db.commit_called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
+@pytest.mark.parametrize("output", [
+    "Mình chưa có đủ thông tin trong dữ liệu tuyển sinh hiện có để trả lời câu hỏi này.",
+    "Mình chưa có đủ bằng chứng trong dữ liệu tuyển sinh hiện có để trả lời câu hỏi này.",
+    "<answer>Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.</answer>",
+    "MÌNH CHƯA TÌM THẤY THÔNG TIN NÀY TRONG DỮ LIỆU TUYỂN SINH HIỆN CÓ",
+    "\nMình chưa tìm thấy\n thông tin này trong dữ liệu tuyển sinh hiện có.\n",
+])
+async def test_allowlisted_abstention_variants_are_canonicalized_in_both_transports(accept, output):
+    from src.generation.rag_chain import FALLBACK_ANSWER
+
+    chain, llm = _abstention_chain(output)
+    chat.rag_chain = chain
+    response = await request("POST", "/api/chat", json={"message": "Điểm SAT tối thiểu?"}, headers={"Accept": accept})
+    assert response.status_code == 200
+    assert "event: error" not in response.text
+    payload = response_payload(response, accept)
+    assert payload["answer"] == FALLBACK_ANSWER
+    assert payload["route_type"] == "out_of_scope" and payload["citations"] == []
+    llm.generate.assert_called_once()
+    llm.generate_stream.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
+@pytest.mark.parametrize("output", [
+    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. Học phí đại trà 58,3 triệu/năm [1].",
+    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. Điểm SAT tối thiểu 9999 [1].",
+    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. Ngành Thú y được tuyển sinh [1].",
+    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. [99]",
+    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. [1]",
+    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. Bạn hãy thử lại.",
+    "<|channel|analysis>Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.",
+    "<analysis>PRIVATE_INTERNAL</analysis>Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.",
+    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.<|turn|>",
+    "<answer>Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.",
+    "<answer>Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.</final>",
+    "<analysis>PRIVATE_INTERNAL</analysis>",
+    "\x85Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.",
+    "", " \n\t", None, 123, {}, [],
+])
+async def test_unsafe_abstention_outputs_reject_before_stream_and_session_persistence(accept, output, caplog):
+    from src.generation.rag_chain import FALLBACK_ANSWER
+
+    chain, llm = _abstention_chain(output)
+    chat.rag_chain = chain
+    db = FakeDB()
+    response = await request("POST", "/api/chat", json={"message": "Điểm SAT tối thiểu?"}, db=db, headers={"Accept": accept})
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "GENERATION_UNGROUNDED"
+    assert "data:" not in response.text and "event: error" not in response.text
+    assert FALLBACK_ANSWER not in response.text and "PRIVATE_INTERNAL" not in response.text
+    assert not db.commit_called and db.records == []
+    assert all(history == [] for history in chat.session_memory.sessions.values())
+    assert "PRIVATE_INTERNAL" not in caplog.text
+    llm.generate.assert_called_once()
+    llm.generate_stream.assert_not_called()
+
+
+@pytest.mark.parametrize("mismatch", ["point_id", "payload"])
+def test_f10_rejects_same_count_wrong_collection_before_loading_model(mismatch):
+    from qdrant_client import models
+    from src.ingestion.chunker import Chunk
+    from src.retrieval.dense_search import QdrantDenseSearch
+    from src.runtime_resources import StartupCheckError
+
+    chunk = Chunk("local-record", "Pinned admissions content", {"source_url": "https://example.test/pinned"})
+    manifest = _current_index_manifest(chat.settings.QDRANT_COLLECTION)
+    manifest.update(chunk_count=1, embedding_dimension=1024)
+    vectors = SimpleNamespace(size=1024, distance=models.Distance.COSINE)
+    client = MagicMock()
+    client.collection_exists.return_value = True
+    client.count.return_value.count = 1
+    client.get_collection.return_value = SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=vectors)))
+    payload = {**chunk.metadata, "chunk_id": chunk.chunk_id, "content": chunk.content, "metadata": dict(chunk.metadata)}
+    point_id = QdrantDenseSearch._point_id(chunk.chunk_id)
+    if mismatch == "point_id":
+        point_id = QdrantDenseSearch._point_id("unrelated-record")
+    else:
+        payload["content"] = "Unrelated content with the same ID"
+    client.scroll.return_value = ([SimpleNamespace(id=point_id, payload=payload)], None)
+    with (
+        patch("api.main.QdrantClient", return_value=client),
+        patch("api.main.Embedder") as model,
+        patch("api.main.BM25Search"),
+        patch("api.main.HybridRetriever"),
+    ):
+        try:
+            build_hybrid_retriever([chunk], manifest)
+        except StartupCheckError as error:
+            assert error.code == "QDRANT_INDEX_MISMATCH"
+        else:
+            pytest.fail(f"F10: accepted wrong {mismatch}; count=1, dimension=1024, scroll_calls={client.scroll.call_count}, model_initializations={model.call_count}")
+        model.assert_not_called()
+    client.close.assert_called_once()
+
+
+def _f10_collection():
+    from qdrant_client import models
+    from src.ingestion.chunker import Chunk
+    from src.qdrant_integrity import expected_payload, point_id
+
+    chunks = [Chunk(f"pinned-{i}", f"Pinned content {i}", {"year": 2026}) for i in range(2)]
+    manifest = _current_index_manifest(chat.settings.QDRANT_COLLECTION)
+    manifest.update(chunk_count=2, document_count=1, embedding_dimension=1024)
+    vectors = SimpleNamespace(size=1024, distance=models.Distance.COSINE)
+    client = MagicMock()
+    client.collection_exists.return_value = True
+    client.count.return_value.count = len(chunks)
+    client.get_collection.return_value = SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=vectors)))
+    points = [SimpleNamespace(id=point_id(chunk.chunk_id), payload=expected_payload({
+        "chunk_id": chunk.chunk_id, "content": chunk.content, "metadata": chunk.metadata,
+    })) for chunk in chunks]
+    client.scroll.return_value = (points, None)
+    return chunks, manifest, client, points
+
+
+def test_f10_matching_collection_inspection_precedes_the_only_model_initialization():
+    chunks, manifest, client, points = _f10_collection()
+    events = []
+    model_instance = MagicMock()
+    client.scroll.side_effect = lambda **_: events.append("inspect") or (points, None)
+    with (
+        patch("api.main.QdrantClient", return_value=client),
+        patch("api.main.Embedder", side_effect=lambda **_: events.append("model") or model_instance) as model,
+        patch("api.main.BM25Search"),
+        patch("api.main.HybridRetriever") as hybrid,
+    ):
+        result_client, retriever, result_manifest = build_hybrid_retriever(chunks, manifest)
+    assert events == ["inspect", "model"]
+    model.assert_called_once()
+    assert result_client is client and result_manifest is manifest and retriever is hybrid.return_value
+    assert hybrid.call_args.args[0].embedder is model_instance
+    client.close.assert_not_called()
+    for mutation in (client.upsert, client.delete, client.create_collection, client.recreate_collection):
+        mutation.assert_not_called()
+
+
+@pytest.mark.parametrize("failure,code", [
+    ("content", "QDRANT_INDEX_MISMATCH"), ("metadata", "QDRANT_INDEX_MISMATCH"),
+    ("missing", "QDRANT_INDEX_MISMATCH"), ("duplicate", "QDRANT_INDEX_MISMATCH"),
+    ("count", "QDRANT_INDEX_MISMATCH"), ("dimension", "QDRANT_INDEX_MISMATCH"),
+    ("scroll-error", "QDRANT_INSPECTION_FAILED"), ("empty-continuation", "QDRANT_INSPECTION_FAILED"),
+])
+@pytest.mark.asyncio
+async def test_f10_failed_integrity_never_publishes_rag_or_loads_bge_and_closes_client(failure, code):
+    from src.qdrant_integrity import point_id
+
+    chunks, manifest, client, points = _f10_collection()
+    if failure == "content":
+        points[0].payload["content"] = "Wrong content"
+    elif failure == "metadata":
+        points[0].payload["metadata"]["year"] = 2025
+    elif failure == "missing":
+        client.scroll.return_value = (points[:1], None)
+    elif failure == "duplicate":
+        client.scroll.return_value = ([points[0], points[0]], None)
+    elif failure == "count":
+        client.count.return_value.count = 3
+    elif failure == "dimension":
+        client.get_collection.return_value.config.params.vectors.size = 768
+    elif failure == "scroll-error":
+        client.scroll.side_effect = TimeoutError("private endpoint")
+    else:
+        client.scroll.return_value = ([], point_id("cursor"))
+    with (
+        patch("api.main.init_db", new=AsyncMock()),
+        patch("api.main.load_local_index", return_value=(chunks, manifest)),
+        patch("api.main.load_hybrid_retriever", side_effect=build_hybrid_retriever) as loader,
+        patch("api.main.QdrantClient", return_value=client),
+        patch("api.main.Embedder") as model,
+        patch.object(chat, "initialize_rag") as initialize,
+    ):
+        await startup_event()
+        for _ in range(3):
+            payload = await health_check()
+    assert payload["status"] == "degraded"
+    assert payload["components"]["qdrant"]["ready"] is False
+    assert payload["components"]["rag"]["ready"] is False
+    assert payload["runtime"]["startup_error_code"] == code
+    assert payload["runtime"]["recovery_blocked"] is (code == "QDRANT_INDEX_MISMATCH")
+    loader.assert_called_once()
+    model.assert_not_called()
+    initialize.assert_not_called()
+    client.close.assert_called_once()
+    for mutation in (client.upsert, client.delete, client.create_collection, client.recreate_collection):
+        mutation.assert_not_called()
+
+
+def test_f10_cleanup_error_cannot_mask_integrity_failure(caplog):
+    from src.runtime_resources import StartupCheckError
+
+    chunks, manifest, client, points = _f10_collection()
+    points[0].payload["content"] = "wrong"
+    client.close.side_effect = RuntimeError("PRIVATE_CLEANUP")
+    with patch("api.main.QdrantClient", return_value=client), patch("api.main.Embedder") as model:
+        with pytest.raises(StartupCheckError) as error:
+            build_hybrid_retriever(chunks, manifest)
+    assert error.value.code == "QDRANT_INDEX_MISMATCH"
+    client.close.assert_called_once()
+    model.assert_not_called()
+    assert "PRIVATE_CLEANUP" not in caplog.text
+
+
+def test_f10_model_failure_after_successful_inspection_closes_unpublished_client():
+    chunks, manifest, client, _ = _f10_collection()
+    with patch("api.main.QdrantClient", return_value=client), patch("api.main.Embedder", side_effect=MemoryError("allocation")):
+        with pytest.raises(MemoryError):
+            build_hybrid_retriever(chunks, manifest)
+    client.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_f10_verified_collection_can_become_healthy_and_close_normally():
+    from api.main import shutdown_event
+
+    chunks, manifest, client, _ = _f10_collection()
+    def initialize(**kwargs):
+        chat.rag_chain = object()
+        chat.rag_manifest = kwargs["manifest"]
+    with (
+        patch("api.main.init_db", new=AsyncMock()),
+        patch("api.main.load_local_index", return_value=(chunks, manifest)),
+        patch("api.main.load_hybrid_retriever", side_effect=build_hybrid_retriever),
+        patch("api.main.QdrantClient", return_value=client),
+        patch("api.main.Embedder") as model,
+        patch("api.main.BM25Search"),
+        patch("api.main.HybridRetriever"),
+        patch.object(chat, "initialize_rag", side_effect=initialize),
+    ):
+        await startup_event()
+        payload = await health_check()
+        assert payload["status"] == "healthy"
+        assert payload["components"]["rag"]["ready"] is True
+        assert app.state.qdrant_client is client
+        model.assert_called_once()
+        client.scroll.assert_called_once()
+        client.close.assert_not_called()
+        await shutdown_event()
+    client.close.assert_called_once()

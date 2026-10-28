@@ -6,6 +6,7 @@ const PUBLIC_MESSAGES = {
   BACKEND_TIMEOUT: "Dịch vụ tư vấn đang mất nhiều thời gian hơn dự kiến.",
   INVALID_BACKEND_RESPONSE: "Dịch vụ tư vấn trả về phản hồi không hợp lệ.",
   RAG_UNAVAILABLE: "Dịch vụ tư vấn đang tạm thời chưa sẵn sàng.",
+  GENERATION_UNGROUNDED: "Chưa thể xác minh câu trả lời từ nguồn tuyển sinh hiện có.",
   LLM_TIMEOUT: "Yêu cầu xử lý mất nhiều thời gian hơn dự kiến.",
   LLM_AUTHENTICATION_FAILED:
     "Dịch vụ xử lý câu hỏi đang tạm thời chưa sẵn sàng.",
@@ -30,7 +31,7 @@ export function backendTimeoutMs(env = process.env) {
   return positiveInteger(env.BACKEND_REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
 }
 
-export function structuredError(code, status) {
+export function structuredError(code, status, headers = {}) {
   return Response.json(
     {
       error: {
@@ -38,7 +39,7 @@ export function structuredError(code, status) {
         message: PUBLIC_MESSAGES[code] || PUBLIC_MESSAGES.INTERNAL_ERROR,
       },
     },
-    { status },
+    { status, headers },
   );
 }
 
@@ -86,10 +87,13 @@ export async function proxyBackend(
   }
 
   const contentType = upstream.headers.get("content-type") || "";
+  const requestId = upstream.headers.get("x-request-id");
+  const correlationHeaders = /^[a-f0-9]{32}$/i.test(requestId || "")
+    ? { "x-request-id": requestId } : {};
   if (upstream.ok && contentType.includes("text/event-stream")) {
     if (!upstream.body) {
       clearTimeout(timeout);
-      return structuredError("INVALID_BACKEND_RESPONSE", 502);
+      return structuredError("INVALID_BACKEND_RESPONSE", 503, correlationHeaders);
     }
 
     const reader = upstream.body.getReader();
@@ -118,6 +122,7 @@ export async function proxyBackend(
     return new Response(stream, {
       status: upstream.status,
       headers: {
+        ...correlationHeaders,
         "content-type": contentType,
         "cache-control":
           upstream.headers.get("cache-control") || "no-cache, no-transform",
@@ -142,15 +147,16 @@ export async function proxyBackend(
   try {
     payload = responseText ? JSON.parse(responseText) : {};
   } catch {
-    return structuredError("INVALID_BACKEND_RESPONSE", 502);
+    return structuredError("INVALID_BACKEND_RESPONSE", 503, correlationHeaders);
   }
 
   if (!upstream.ok) {
     return structuredError(
       normalizedUpstreamCode(upstream.status, payload),
-      upstream.status,
+      upstream.status === 502 ? 503 : upstream.status,
+      correlationHeaders,
     );
   }
 
-  return Response.json(payload, { status: upstream.status });
+  return Response.json(payload, { status: upstream.status, headers: correlationHeaders });
 }
