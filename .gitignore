@@ -32,6 +32,8 @@ MANIFEST
 *.manifest
 *.spec
 
+data
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
@@ -216,3 +218,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Phase 0 ignores
+.env
+__pycache__/
+*.db
+venv/
+.pytest_cache/
+eval_results/
+data/raw/
+data/index/
+*.pyc
+
+docs/acquired_knowledge
+
+models
+
+# Local runtime state, evaluation reports and temporary test/release artifacts.
+# Keep these on disk; only source, tests and durable documentation belong in Git.
+/domain-rrf-results/
+/unified-local-results/
+/legacy-removal-results/
+/test-results/

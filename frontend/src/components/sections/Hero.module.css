@@ -1,0 +1,120 @@
+.hero {
+  position: relative;
+  min-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  background-image: url('https://tuyensinh.ptit.edu.vn/wp-content/uploads/sites/4/2024/09/bn-top2.jpg');
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+  color: var(--white);
+}
+
+.heroOverlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(to right, rgba(11, 26, 73, 0.9), rgba(11, 26, 73, 0.6));
+  z-index: 1;
+}
+
+.heroContainer {
+  position: relative;
+  z-index: 2;
+  padding: 4rem 1rem;
+}
+
+.heroContent {
+  max-width: 800px;
+}
+
+.heroTitle {
+  font-size: 3.5rem;
+  font-weight: 800;
+  line-height: 1.1;
+  margin-bottom: 1.5rem;
+  color: var(--white);
+}
+
+.heroSubtitle {
+  font-size: 1.25rem;
+  margin-bottom: 2.5rem;
+  opacity: 0.9;
+  max-width: 600px;
+}
+
+.heroActions {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.btnLarge {
+  padding: 1rem 2rem;
+  font-size: 1.1rem;
+}
+
+.btnOutline {
+  border: 2px solid var(--white);
+  color: var(--white);
+  padding: 1rem 2rem;
+  font-size: 1.1rem;
+  background: transparent;
+}
+
+.btnOutline:hover {
+  background-color: var(--white);
+  color: var(--heading);
+}
+
+/* Stats Banner */
+.statsBanner {
+  position: relative;
+  z-index: 2;
+  background-color: var(--primary);
+  margin-top: auto;
+  box-shadow: 0 -10px 20px rgba(0,0,0,0.1);
+}
+
+.statsGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2rem;
+  padding: 2rem 1rem;
+}
+
+.statItem {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+.statItem i {
+  font-size: 2.5rem;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.statItem h4 {
+  color: var(--white);
+  font-size: 1.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.statItem p {
+  font-size: 0.9rem;
+  opacity: 0.9;
+}
+
+@media (max-width: 1024px) {
+  .heroTitle {
+    font-size: 2.5rem;
+  }
+  
+  .statsGrid {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+}
