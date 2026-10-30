@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from numbers import Integral
+from pathlib import Path
 from threading import Lock
 from typing import Any, ClassVar, Optional
 
 import numpy as np
+from huggingface_hub import snapshot_download
 from sentence_transformers import SentenceTransformer
 
 from src.config import settings
@@ -16,7 +18,7 @@ class Embedder:
 
     # API workers commonly construct more than one retriever. Reusing the model
     # here prevents another multi-GB BGE-M3 load in the same Python process.
-    _model_cache: ClassVar[dict[tuple[str, object], Any]] = {}
+    _model_cache: ClassVar[dict[tuple[str, str, bool, object], Any]] = {}
     _model_cache_lock: ClassVar[Lock] = Lock()
 
     def __init__(self, model_name: Optional[str] = None):
@@ -30,22 +32,42 @@ class Embedder:
     @classmethod
     def _get_or_load_model(cls, model_name: str) -> SentenceTransformer:
         # Including the factory in the key keeps test/injected factories isolated
-        # while still caching normal SentenceTransformer instances by model name.
-        cache_key = (model_name, SentenceTransformer)
+        # while also isolating different cache directories/offline policies.
+        cache_key = (model_name, str(settings.HUGGINGFACE_CACHE_DIR),
+                     bool(settings.MODELS_LOCAL_ONLY), SentenceTransformer)
         with cls._model_cache_lock:
             cached = cls._model_cache.get(cache_key)
             if cached is not None:
                 return cached
             try:
+                # Some tokenizer versions call model_info even with
+                # local_files_only=True when given a Hub ID. Resolve that ID
+                # offline first, then pass an absolute local directory through
+                # every SentenceTransformer/tokenizer loading stage.
+                local_path = Path(model_name)
+                if not local_path.is_dir():
+                    local_path = Path(snapshot_download(
+                        repo_id=model_name,
+                        cache_dir=settings.HUGGINGFACE_CACHE_DIR,
+                        local_files_only=True,
+                    ))
                 model = SentenceTransformer(
-                    model_name,
+                    str(local_path.resolve()),
                     cache_folder=settings.HUGGINGFACE_CACHE_DIR,
                     local_files_only=True,
                 )
-            # Some transformers releases surface an incomplete local snapshot
-            # as AttributeError rather than OSError. In that case, let the
-            # normal Hugging Face resolution path repair/download the model.
-            except (OSError, ValueError, AttributeError):
+            # Incomplete snapshots may surface as OSError, ValueError or
+            # AttributeError. Local mode never repairs/downloads implicitly.
+            except (OSError, ValueError, AttributeError) as exc:
+                from src.runtime_resources import failure_code
+                if failure_code(exc, "rag") == "INSUFFICIENT_MEMORY":
+                    raise
+                if settings.MODELS_LOCAL_ONLY:
+                    from src.runtime_resources import StartupCheckError
+                    raise StartupCheckError(
+                        "MODEL_UNAVAILABLE",
+                        "BGE-M3 is unavailable in the local model cache. Restore the complete local snapshot; automatic downloads are disabled.",
+                    )
                 token = settings.HF_TOKEN
                 model = SentenceTransformer(
                     model_name,

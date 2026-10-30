@@ -25,6 +25,9 @@ class Reranker:
                 local_files_only=True,
             )
         except LocalEntryNotFoundError:
+            if settings.MODELS_LOCAL_ONLY:
+                from src.runtime_resources import StartupCheckError
+                raise StartupCheckError("MODEL_UNAVAILABLE", "Automatic neural reranker downloads are disabled.")
             token = settings.HF_TOKEN
             model_path = snapshot_download(
                 repo_id=settings.RERANKER_MODEL,

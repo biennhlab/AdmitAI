@@ -12,8 +12,12 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from src.local_profile import LOCAL_INDEX_DIR
+
 DEFAULT_DATASET = PROJECT_ROOT / "eval" / "golden_dataset.json"
-DEFAULT_MANIFEST = PROJECT_ROOT / "data" / "index" / "naive_dense" / "manifest.json"
+DEFAULT_MANIFEST = PROJECT_ROOT / LOCAL_INDEX_DIR / "manifest.json"
 FALLBACK_ANSWER = "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có."
 REQUIRED_CASE_FIELDS = {
     "id",

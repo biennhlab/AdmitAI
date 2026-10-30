@@ -3,6 +3,8 @@ import { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
+  ChatApiError,
+  canRetryChatError,
   friendlyChatError,
   marksServiceUnavailable,
   parseChatStream
@@ -10,6 +12,31 @@ import {
 import styles from './FloatingChatbot.module.css';
 
 const API_URL = '/api/chat';
+
+function citationGroups(citations = []) {
+  const groups = [];
+  const known = new Map();
+  citations.forEach((citation, index) => {
+    // Group only an established document identity. Keep every distinct evidence
+    // location/snippet and keep different document versions separate.
+    const identity = citation.doc_id || citation.source_url
+      ? JSON.stringify([citation.doc_id || '', citation.source_url || '',
+        citation.source_type || '', citation.published_at || '']) : null;
+    let group = identity ? known.get(identity) : null;
+    if (!group) {
+      group = { source: citation, markers: [], members: [] };
+      groups.push(group);
+      if (identity) known.set(identity, group);
+    }
+    const marker = citation.marker ?? index + 1;
+    if (!group.markers.includes(marker)) group.markers.push(marker);
+    const evidenceKey = JSON.stringify([citation.chunk_id, citation.page, citation.section, citation.snippet]);
+    if (!group.members.some(member => member.key === evidenceKey)) {
+      group.members.push({ ...citation, key: evidenceKey });
+    }
+  });
+  return groups;
+}
 
 const markdownComponents = {
   a({ node, ...props }) {
@@ -79,7 +106,7 @@ export default function FloatingChatbot() {
     }
   };
 
-  const sendMessage = async (text) => {
+  const sendMessage = async (text, retryMessageId = null) => {
     if (
       !text
       || !text.trim()
@@ -91,8 +118,10 @@ export default function FloatingChatbot() {
     setShowSuggestions(false);
     
     // Add user message
-    const newUserMsg = { id: Date.now(), role: 'user', content: text.trim() };
-    setMessages((prev) => [...prev, newUserMsg]);
+    const newUserMsg = { id: retryMessageId || Date.now(), role: 'user', content: text.trim() };
+    setMessages((prev) => retryMessageId
+      ? prev.filter(msg => msg.id !== `error-${retryMessageId}` && msg.id !== `bot-${retryMessageId}`)
+      : [...prev, newUserMsg]);
     setInput('');
     setIsLoading(true);
     const newBotMsgId = `bot-${newUserMsg.id}`;
@@ -130,11 +159,20 @@ export default function FloatingChatbot() {
           localStorage.setItem('admitai_session_id', metadata.session_id);
         }
         setMessages(prev => prev.map(msg => 
-          msg.id === newBotMsgId ? { ...msg, citations: metadata.citations || [] } : msg
+          msg.id === newBotMsgId ? { ...msg, citations: metadata.citations || [], answerMode: metadata.answer_mode } : msg
         ));
       });
     } catch (error) {
-      console.error('Chat error:', error);
+      if (error instanceof ChatApiError) {
+        // Expected API rejections are handled below. Logging their Error object
+        // at error level also opens Next.js's development error overlay.
+        console.warn('Chat request rejected:', {
+          code: error.code, status: error.status,
+          ...(error.requestId ? { requestId: error.requestId } : {})
+        });
+      } else {
+        console.error('Chat error:', error);
+      }
       const isOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
       if (!isOnline || marksServiceUnavailable(error)) {
         setServiceStatus('unavailable');
@@ -146,6 +184,10 @@ export default function FloatingChatbot() {
         isError: true,
         citations: []
       };
+      if (canRetryChatError(error)) {
+        errorMsg.retryQuestion = text.trim();
+        errorMsg.userMessageId = newUserMsg.id;
+      }
       setMessages((prev) => [
         ...prev.filter(msg => msg.id !== newBotMsgId || msg.content.trim()),
         errorMsg
@@ -195,7 +237,9 @@ export default function FloatingChatbot() {
         </div>
 
         <div className={styles.chatArea} ref={chatAreaRef}>
-          {messages.map((msg) => (
+          {messages.map((msg) => {
+            const sources = citationGroups(msg.citations);
+            return (
             <div key={msg.id} className={`${styles.message} ${msg.role === 'bot' ? styles.botMessage : styles.userMessage} ${msg.isError ? styles.error : ''}`}>
               {msg.role === 'bot' && (
                 <div className={styles.messageAvatar}>
@@ -203,6 +247,9 @@ export default function FloatingChatbot() {
                 </div>
               )}
               <div className={styles.messageContent}>
+                {msg.answerMode === 'evidence' && (
+                  <p role="status">Nội dung dưới đây được trích xuất và đối chiếu trực tiếp từ tài liệu tuyển sinh.</p>
+                )}
                 {msg.role === 'bot' ? (
                   <div className={styles.markdown}>
                     <ReactMarkdown
@@ -217,37 +264,59 @@ export default function FloatingChatbot() {
                   <div className={styles.plainText}>{msg.content}</div>
                 )}
                 
-                {msg.citations && msg.citations.length > 0 && (
+                {sources.length > 0 && (
                   <div className={`${styles.citationsContainer} ${openCitations[msg.id] ? styles.openCitation : ''}`}>
                     <button className={styles.citationsToggle} onClick={() => toggleCitation(msg.id)}>
-                      <i className="fa-solid fa-book-open"></i> {msg.citations.length} Nguồn tham khảo
+                      <i className="fa-solid fa-book-open"></i> Nguồn tham khảo ({sources.length})
                       <i className={`fa-solid fa-chevron-down ${styles.toggleIcon}`}></i>
                     </button>
                     
                     <div className={styles.citationsList}>
-                      {msg.citations.map((c, i) => {
+                      {sources.map(({ source: c, markers, members }, i) => {
                         const label = c.title || c.source || 'Tài liệu tuyển sinh PTIT';
-                        const location = [
-                          c.page ? `Trang ${c.page}` : '',
-                          c.section && c.section !== `Trang ${c.page}` ? c.section : ''
-                        ].filter(Boolean).join(' · ');
                         
                         return (
                           <div key={i} className={styles.citationItem}>
                             {c.source_url ? (
                               <a href={c.source_url} target="_blank" rel="noopener noreferrer">
-                                [{c.marker ?? i + 1}] {label}
+                                [{markers.join(', ')}] {label}
                               </a>
                             ) : (
-                              <span>[{c.marker ?? i + 1}] {label}</span>
+                              <span>[{markers.join(', ')}] {label}</span>
                             )}
-                            {location && <div className={styles.citationLocation}>{location}</div>}
-                            {c.snippet && <div className={styles.citationSnippet}>{c.snippet}</div>}
+                            {members.map((evidence) => {
+                              const location = [
+                                evidence.page ? `Trang ${evidence.page}` : '',
+                                evidence.section && evidence.section !== `Trang ${evidence.page}` ? evidence.section : ''
+                              ].filter(Boolean).join(' · ');
+                              return (
+                                <div key={evidence.key}>
+                                  {location && <div className={styles.citationLocation}>{location}</div>}
+                                  {evidence.snippet && (
+                                    <div className={styles.citationSnippet}>
+                                      <ReactMarkdown
+                                        remarkPlugins={[remarkGfm]}
+                                        components={markdownComponents}
+                                        disallowedElements={['img']}
+                                        skipHtml
+                                      >
+                                        {evidence.snippet}
+                                      </ReactMarkdown>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
                           </div>
                         );
                       })}
                     </div>
                   </div>
+                )}
+                {msg.isError && msg.retryQuestion && (
+                  <button type="button" disabled={isLoading} onClick={() => sendMessage(msg.retryQuestion, msg.userMessageId)}>
+                    Gửi lại câu hỏi
+                  </button>
                 )}
                 
                 {msg.role === 'bot' && !msg.isError && msg.id !== 'welcome' && (
@@ -258,7 +327,8 @@ export default function FloatingChatbot() {
                 )}
               </div>
             </div>
-          ))}
+            );
+          })}
           
           {showSuggestions && (
             <div className={styles.suggestedQuestions}>

@@ -241,7 +241,7 @@ DATABASE_URL=sqlite:///./admitai.db
 # === Qdrant ===
 QDRANT_HOST=localhost
 QDRANT_PORT=6333
-QDRANT_COLLECTION=admitai_chunks
+QDRANT_COLLECTION=admitai_chunks_phase_a_20261019_223230
 
 # === Embedding ===
 EMBEDDING_MODEL=BAAI/bge-m3

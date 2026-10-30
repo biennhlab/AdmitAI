@@ -1,5 +1,6 @@
 import pytest
 import numpy as np
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from src.config import Settings, settings
@@ -15,7 +16,12 @@ def test_settings_reads_hf_token_from_environment(monkeypatch):
 
 @pytest.fixture
 def mock_sentence_transformer():
-    with patch("src.retrieval.embedder.SentenceTransformer") as mock_st:
+    # Mocked download compatibility tests opt in explicitly; local mode remains offline.
+    with (
+        patch.object(settings, "MODELS_LOCAL_ONLY", False),
+        patch("src.retrieval.embedder.snapshot_download", return_value=str(Path('cached-test-model').resolve())),
+        patch("src.retrieval.embedder.SentenceTransformer") as mock_st,
+    ):
         mock_model = MagicMock()
         mock_st.return_value = mock_model
         
@@ -34,7 +40,7 @@ def test_embedder_initialization(mock_sentence_transformer):
         mock_settings.EMBEDDING_MODEL = "test-model"
         embedder = Embedder()
         mock_sentence_transformer.assert_called_once_with(
-            "test-model",
+            str(Path('cached-test-model').resolve()),
             cache_folder=mock_settings.HUGGINGFACE_CACHE_DIR,
             local_files_only=True,
         )
@@ -43,7 +49,7 @@ def test_embedder_initialization(mock_sentence_transformer):
     mock_sentence_transformer.reset_mock()
     embedder = Embedder(model_name="custom-model")
     mock_sentence_transformer.assert_called_once_with(
-        "custom-model",
+        str(Path('cached-test-model').resolve()),
         cache_folder=settings.HUGGINGFACE_CACHE_DIR,
         local_files_only=True,
     )
@@ -102,7 +108,34 @@ def test_model_is_reused_within_process(mock_sentence_transformer):
 
     assert first.model is second.model
     mock_sentence_transformer.assert_called_once_with(
-        "shared-test-model",
+        str(Path('cached-test-model').resolve()),
+        cache_folder=settings.HUGGINGFACE_CACHE_DIR,
+        local_files_only=True,
+    )
+
+
+@pytest.mark.parametrize("local_only", [True, False])
+@pytest.mark.parametrize("kind", ["python", "windows1455", "allocator"])
+def test_model_allocation_failure_propagates_without_retry_or_download(monkeypatch, local_only, kind):
+    from src.runtime_resources import failure_code
+
+    error = MemoryError("allocation failed")
+    if kind == "windows1455":
+        error = OSError("native allocation failed")
+        error.winerror = 1455
+    elif kind == "allocator":
+        error = RuntimeError("DefaultCPUAllocator: not enough memory")
+    monkeypatch.setattr(settings, "MODELS_LOCAL_ONLY", local_only)
+    with (
+        patch("src.retrieval.embedder.snapshot_download", return_value=str(Path('cached-test-model').resolve())),
+        patch("src.retrieval.embedder.SentenceTransformer", side_effect=error) as factory,
+    ):
+        with pytest.raises(type(error)) as caught:
+            Embedder("allocation-failure-test-model")
+    assert caught.value is error
+    assert failure_code(caught.value, "rag") == "INSUFFICIENT_MEMORY"
+    factory.assert_called_once_with(
+        str(Path('cached-test-model').resolve()),
         cache_folder=settings.HUGGINGFACE_CACHE_DIR,
         local_files_only=True,
     )

@@ -167,7 +167,7 @@ query_vector = embed_model.encode(query, normalize_embeddings=True)
 
 # Search Qdrant
 results_dense = qdrant_client.search(
-    collection_name="admitai_chunks",
+    collection_name="admitai_chunks_phase_a_20261019_223230",
     query_vector=query_vector,
     limit=20
 )

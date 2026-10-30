@@ -22,11 +22,10 @@ class FakeLLM:
 
     def generate(self, system_prompt, messages):
         self.system_prompt = system_prompt
-        return "Câu trả lời grounded [1]."
+        return "PTIT có phương thức xét tuyển theo điểm thi [1]."
 
 
-def test_processed_markdown_metadata_and_duplicate_policy():
-    tmp_path = Path("data/index/test-loader")
+def test_processed_markdown_metadata_and_duplicate_policy(tmp_path: Path):
     processed = tmp_path / "processed" / "ptit"
     processed.mkdir(parents=True, exist_ok=True)
     source = processed / "source.md"
@@ -50,8 +49,7 @@ def test_processed_markdown_metadata_and_duplicate_policy():
     assert result.documents[0].metadata["source_url"] == "https://ptit.example/source"
 
 
-def test_chunk_to_document_to_url_and_index_round_trip():
-    tmp_path = Path("data/index/test-round-trip")
+def test_chunk_to_document_to_url_and_index_round_trip(tmp_path: Path):
     metadata = {
         "doc_id": "ptit-doc-1",
         "title": "Nguồn PTIT",

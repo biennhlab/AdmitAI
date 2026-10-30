@@ -93,7 +93,7 @@ class QueryRewriter:
                 temperature=0.0,
             )
         except Exception as exc:  # Provider errors and timeouts share the same fallback.
-            logger.warning("Query rewrite failed; using the original query: %s", exc)
+            logger.warning("Query rewrite failed; using the original query error_class=%s", type(exc).__name__)
             return original
 
         rewritten = _clean_output(output)
@@ -114,7 +114,7 @@ class QueryRewriter:
         ):
             logger.warning("Query rewrite dropped source terms; using the original query")
             return original
-        runtime_logger.info("Rewritten query: %s", rewritten)
+        runtime_logger.info("Query rewrite completed")
         return rewritten
 
 

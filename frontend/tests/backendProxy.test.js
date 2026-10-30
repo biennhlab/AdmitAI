@@ -4,6 +4,19 @@ import { POST as proxyChat } from '@/app/api/chat/route.js';
 import { proxyBackend } from '@/lib/backendProxy.mjs';
 
 describe('controlled backend proxy', () => {
+  it.each(['json', 'sse', 'error'])('preserves the backend request ID for %s responses', async (kind) => {
+    const id = '1234567890abcdef1234567890abcdef';
+    const upstream = kind === 'sse'
+      ? new Response('data: {"type":"chunk","text":"Verified"}\n\n', {
+        headers: { 'content-type': 'text/event-stream', 'x-request-id': id }
+      })
+      : Response.json(kind === 'error' ? { detail: { code: 'INVALID_GENERATION' } } : { answer: 'Verified' }, {
+        status: kind === 'error' ? 502 : 200, headers: { 'x-request-id': id }
+      });
+    const response = await proxyBackend('/api/chat', { fetchImpl: vi.fn().mockResolvedValue(upstream), timeoutMs: 100 });
+    expect(response.headers.get('x-request-id')).toBe(id);
+    await response.text();
+  });
   afterEach(() => {
     vi.unstubAllGlobals();
   });
@@ -69,6 +82,19 @@ describe('controlled backend proxy', () => {
     expect(JSON.stringify(payload)).not.toContain('secret internal path');
   });
 
+  it('preserves generation format failure separately from retrieval errors', async () => {
+    const response = await proxyBackend('/api/chat', {
+      fetchImpl: vi.fn().mockResolvedValue(Response.json(
+        { detail: { code: 'INVALID_GENERATION', message: 'internal unsupported output' } },
+        { status: 502 }
+      )), timeoutMs: 100
+    });
+    expect(response.status).toBe(503);
+    const payload = await response.json();
+    expect(payload.error.code).toBe('INVALID_GENERATION');
+    expect(JSON.stringify(payload)).not.toContain('internal unsupported output');
+  });
+
   it.each(['ECONNREFUSED', 'ECONNRESET'])('maps %s to BACKEND_UNAVAILABLE', async (code) => {
     const networkError = Object.assign(new Error(code), { code });
     const response = await proxyBackend('/api/chat', {
@@ -104,7 +130,7 @@ describe('controlled backend proxy', () => {
       timeoutMs: 100
     });
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(503);
     expect((await response.json()).error.code).toBe('INVALID_BACKEND_RESPONSE');
   });
 });

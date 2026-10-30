@@ -100,7 +100,7 @@ Chunk bảng biểu:
 
 ```json
 {
-  "collection_name": "admitai_chunks",
+  "collection_name": "admitai_chunks_phase_a_20261019_223230",
   "vectors": {
     "size": 1024,
     "distance": "Cosine"

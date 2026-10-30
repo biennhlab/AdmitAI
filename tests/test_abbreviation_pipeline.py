@@ -28,7 +28,7 @@ def test_rag_chain_normalizes_then_rewrites_before_retrieval():
         "Điểm chuẩn ngành cntt (Công nghệ thông tin) năm 2025 là bao nhiêu?"
     )
     llm = MagicMock()
-    llm.generate.return_value = "Điểm chuẩn được công bố trong nguồn [1]."
+    llm.generate.return_value = "Điểm chuẩn CNTT năm 2025 [1]."
     question = "điểm chuẩn cntt 2025"
 
     response = RAGChain(

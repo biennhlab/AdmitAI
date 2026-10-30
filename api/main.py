@@ -1,5 +1,8 @@
 import asyncio
 import logging
+import os
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +14,8 @@ from sqlalchemy import text
 from slowapi.errors import RateLimitExceeded
 from api.routers import chat, auth, admin
 from src.config import settings
+from src.runtime_resources import StartupCheckError, failure_code
+from src.qdrant_integrity import inspect_qdrant_points
 from src.database.connection import engine, init_db
 from src.retrieval import (
     BM25Search,
@@ -18,6 +23,11 @@ from src.retrieval import (
     HybridRetriever,
     QdrantDenseSearch,
     load_dense_index,
+)
+from src.retrieval.index_version import (
+    INDEX_BUILD_REVISION,
+    index_build_fingerprint,
+    manifest_build_stale_reasons,
 )
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -27,6 +37,23 @@ logger = logging.getLogger(__name__)
 _rag_recovery_lock = asyncio.Lock()
 
 app = FastAPI(title="AdmitAI API")
+app.state.rag_recovery = {"blocked": False, "error_code": None, "retry_at": 0.0}
+
+
+def _record_startup_failure(stage: str, exc: BaseException) -> None:
+    code = failure_code(exc, stage)
+    blocked = code in {
+        "INSUFFICIENT_MEMORY", "MODEL_UNAVAILABLE",
+        "INDEX_MISSING", "INDEX_INVALID", "INDEX_FINGERPRINT_MISSING",
+        "INDEX_INCOMPATIBLE", "COLLECTION_MISMATCH", "QDRANT_INDEX_MISMATCH",
+    }
+    app.state.rag_recovery = {
+        "blocked": blocked, "error_code": code,
+        "retry_at": time.monotonic() + settings.RAG_RECOVERY_COOLDOWN_SECONDS,
+    }
+    if stage in app.state.components:
+        app.state.components[stage]["error_code"] = code
+    logger.error("startup_check stage=%s code=%s automatic_retry=%s", stage, code, not blocked)
 
 _NOT_STARTED = {"ready": False, "error": "Startup check has not completed."}
 app.state.components = {
@@ -53,18 +80,54 @@ def _llm_is_configured() -> bool:
     return bool(key) and key.lower() not in {"placeholder", "your_gemini_api_key_here"}
 
 
+def _validate_manifest_collection(manifest: dict[str, Any]) -> None:
+    manifest_collection = manifest.get("qdrant_collection")
+    if manifest_collection != settings.QDRANT_COLLECTION:
+        raise StartupCheckError("COLLECTION_MISMATCH",
+            f"Index collection '{manifest_collection}' differs from configured Qdrant "
+            f"collection '{settings.QDRANT_COLLECTION}'; update INDEX_DIR and "
+            "QDRANT_COLLECTION together"
+        )
+
+
 def load_local_index() -> tuple[list[Any], dict[str, Any]]:
     """Load and validate the local snapshot without contacting other services."""
-    chunks, _embeddings, manifest = load_dense_index(settings.INDEX_DIR)
+    try:
+        chunks, _embeddings, manifest = load_dense_index(settings.INDEX_DIR)
+    except FileNotFoundError as exc:
+        raise StartupCheckError("INDEX_MISSING", "Configured index files are missing; check INDEX_DIR before considering any rebuild.") from exc
     if manifest.get("module") != 3:
-        raise RuntimeError(
+        raise StartupCheckError("INDEX_INCOMPATIBLE",
             f"Index at '{settings.INDEX_DIR}' was built by module {manifest.get('module')}; "
             "run scripts/ingest.py --module 3 before starting the API"
         )
     if manifest.get("embedding_model") != settings.EMBEDDING_MODEL:
-        raise RuntimeError(
+        raise StartupCheckError("INDEX_INCOMPATIBLE",
             f"Index model '{manifest.get('embedding_model')}' differs from configured "
             f"model '{settings.EMBEDDING_MODEL}'; run module 3 ingestion again"
+        )
+    _validate_manifest_collection(manifest)
+    expected_build_fingerprint = index_build_fingerprint(
+        3,
+        embedding_model=settings.EMBEDDING_MODEL,
+        chunk_size=settings.CHUNK_SIZE,
+        chunk_overlap=settings.CHUNK_OVERLAP,
+        table_chunk_size=settings.TABLE_CHUNK_SIZE,
+        parent_chunk_size=settings.PARENT_CHUNK_SIZE,
+        child_chunk_size=settings.CHILD_CHUNK_SIZE,
+    )
+    stale_reasons = manifest_build_stale_reasons(
+        manifest,
+        expected_corpus_fingerprint=str(manifest.get("corpus_fingerprint") or ""),
+        expected_build_fingerprint=expected_build_fingerprint,
+        expected_revision=INDEX_BUILD_REVISION,
+    )
+    if stale_reasons:
+        code = "INDEX_FINGERPRINT_MISSING" if any(reason.endswith("_missing") for reason in stale_reasons) else "INDEX_INCOMPATIBLE"
+        raise StartupCheckError(code,
+            f"Index at '{settings.INDEX_DIR}' is stale ({', '.join(stale_reasons)}); "
+            "select the validated index/collection pair or run the read-only migration preflight. "
+            "Do not fabricate fingerprints or rebuild a valid existing index."
         )
     return chunks, manifest
 
@@ -76,30 +139,38 @@ def load_hybrid_retriever(
     """Load and validate both retrieval branches once for this API process."""
     if chunks is None or manifest is None:
         chunks, manifest = load_local_index()
+    _validate_manifest_collection(manifest)
 
     client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
     try:
         if not client.collection_exists(settings.QDRANT_COLLECTION):
-            raise RuntimeError(
+            raise StartupCheckError("QDRANT_UNAVAILABLE",
                 f"Qdrant collection '{settings.QDRANT_COLLECTION}' does not exist; "
-                "run scripts/ingest.py --module 3"
+                "verify the configured index/collection pair; no data was changed"
             )
         qdrant_count = int(
             client.count(collection_name=settings.QDRANT_COLLECTION, exact=True).count
         )
         if qdrant_count != len(chunks):
-            raise RuntimeError(
+            raise StartupCheckError("QDRANT_INDEX_MISMATCH",
                 f"Qdrant collection '{settings.QDRANT_COLLECTION}' has {qdrant_count} chunks, "
-                f"but the BM25 snapshot has {len(chunks)}; run module 3 ingestion again"
+                f"but the BM25 snapshot has {len(chunks)}; no data was changed"
             )
 
-        embedder = Embedder(model_name=settings.EMBEDDING_MODEL)
         dense_search = QdrantDenseSearch(
             client,
             settings.QDRANT_COLLECTION,
-            embedder,
+            None,
         )
-        dense_search.validate_ready(int(manifest["embedding_dimension"]))
+        try:
+            dense_search.validate_ready(int(manifest["embedding_dimension"]))
+        except ValueError as exc:
+            raise StartupCheckError("QDRANT_INDEX_MISMATCH", "Qdrant vector configuration does not match the local index") from exc
+        records = [{"chunk_id": chunk.chunk_id, "content": chunk.content, "metadata": chunk.metadata} for chunk in chunks]
+        integrity = inspect_qdrant_points(client, settings.QDRANT_COLLECTION, records)
+        if not integrity["compatible"]:
+            raise StartupCheckError("QDRANT_INDEX_MISMATCH", "Qdrant point IDs or payloads differ from the local searchable index; no data was changed")
+        dense_search.embedder = Embedder(model_name=settings.EMBEDDING_MODEL)
         sparse_search = BM25Search()
         sparse_search.index(chunks)
         retriever = HybridRetriever(
@@ -109,11 +180,15 @@ def load_hybrid_retriever(
         )
         return client, retriever, manifest
     except Exception:
-        client.close()
+        try:
+            client.close()
+        except Exception:
+            logger.warning("Qdrant client cleanup failed during startup")
         raise
 
 @app.on_event("startup")
 async def startup_event():
+    app.state.rag_recovery = {"blocked": False, "error_code": None, "retry_at": 0.0}
     app.state.components = {
         "database": {"ready": False, "error": "Database initialization failed."},
         "local_index": {"ready": False, "error": "Local index is unavailable or invalid."},
@@ -136,6 +211,7 @@ async def startup_event():
             "embedding_model": manifest.get("embedding_model"),
         }
     except Exception as exc:
+        _record_startup_failure("local_index", exc)
         chat.mark_rag_unavailable(exc, "Chỉ mục tuyển sinh đang tạm thời chưa sẵn sàng.")
         logger.exception("Local index startup check failed; API is running in degraded mode")
         return
@@ -152,6 +228,7 @@ async def startup_event():
             "chunks": len(chunks),
         }
     except Exception as exc:
+        _record_startup_failure("qdrant", exc)
         chat.mark_rag_unavailable(exc, "Kho dữ liệu tuyển sinh đang tạm thời chưa sẵn sàng.")
         logger.exception("Qdrant startup check failed; API is running in degraded mode")
         return
@@ -183,6 +260,7 @@ async def startup_event():
             manifest["chunk_count"],
         )
     except Exception as exc:
+        _record_startup_failure("rag", exc)
         chat.mark_rag_unavailable(exc)
         # Health reports the failure and /api/chat returns 503; the API itself
         # stays available so operators can ingest and restart it.
@@ -235,11 +313,15 @@ async def health_check():
         (not components["qdrant"]["ready"] or qdrant_client is None)
         and components["local_index"]["ready"]
         and components["llm"]["configured"]
+        and not app.state.rag_recovery["blocked"]
+        and time.monotonic() >= app.state.rag_recovery["retry_at"]
     ):
         async with _rag_recovery_lock:
             # Another health request may have completed recovery while waiting.
             qdrant_client = getattr(app.state, "qdrant_client", None)
-            if not app.state.components["qdrant"]["ready"] or qdrant_client is None:
+            if (not app.state.rag_recovery["blocked"]
+                and time.monotonic() >= app.state.rag_recovery["retry_at"]
+                and (not app.state.components["qdrant"]["ready"] or qdrant_client is None)):
                 candidate_client = None
                 try:
                     chunks, manifest = await asyncio.to_thread(load_local_index)
@@ -265,9 +347,11 @@ async def health_check():
                         "chunks": len(chunks),
                     }
                     candidate_client = None
+                    app.state.rag_recovery = {"blocked": False, "error_code": None, "retry_at": 0.0}
                     if old_client is not None and old_client is not qdrant_client:
                         await asyncio.to_thread(old_client.close)
-                except Exception:
+                except Exception as exc:
+                    _record_startup_failure("qdrant", exc)
                     if candidate_client is not None:
                         await asyncio.to_thread(candidate_client.close)
                     logger.exception("RAG recovery failed; API remains in degraded mode")
@@ -314,10 +398,20 @@ async def health_check():
         and components["llm"]["configured"]
         and components["rag"]["ready"]
     )
-    return {"status": "healthy" if all_ready else "degraded", "components": components}
+    revision = os.getenv("ADMITAI_APPLICATION_REVISION", "")
+    return {
+        "status": "healthy" if all_ready else "degraded", "components": components,
+        "runtime": {
+            "pid": os.getpid(), "application_revision": revision if len(revision) == 64 and all(char in "0123456789abcdef" for char in revision) else None,
+            "local_dev_profile": settings.LOCAL_DEV_PROFILE,
+            "rerank_backend": settings.RERANK_BACKEND,
+            "neural_reranker_module_loaded": "src.retrieval.reranker" in sys.modules,
+            "recovery_blocked": app.state.rag_recovery["blocked"],
+            "startup_error_code": app.state.rag_recovery["error_code"],
+        },
+    }
 
 
 frontend_dir = Path(__file__).resolve().parents[1] / "frontend" / "chatbot"
 if frontend_dir.exists():
     app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="chatbot")
-# Trigger reload

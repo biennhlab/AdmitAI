@@ -118,10 +118,10 @@ def test_build_rag_prompt_and_format_citations():
     assert "retrieved_context" not in messages[0]["content"]
 
 
-def test_system_prompt_enforces_grounding_and_natural_markdown():
+def test_system_prompt_uses_sources_and_natural_markdown():
     assert "Chỉ dùng thông tin có trong <retrieved_context>" in SYSTEM_PROMPT
     assert "không suy đoán" in SYSTEM_PROMPT
-    assert "marker [n] ngay cuối ý hoặc cuối đoạn" in SYSTEM_PROMPT
+    assert "Backend tạo marker [n]" in SYSTEM_PROMPT
     assert "Không tự tạo URL" in SYSTEM_PROMPT
     assert "Không nhắc hoặc giải thích các cấu trúc nội bộ" in SYSTEM_PROMPT
     for internal_term in (
@@ -151,7 +151,7 @@ def test_system_prompt_enforces_grounding_and_natural_markdown():
     assert "Chỉ dùng tối đa một emoji" in SYSTEM_PROMPT
     assert "dữ liệu tham khảo nội bộ" in SYSTEM_PROMPT
     assert "Không được sao chép cấu trúc, tên trường, nhãn document hoặc metadata" in SYSTEM_PROMPT
-    assert "Chỉ xuất câu trả lời cuối cùng" in SYSTEM_PROMPT
+    assert "Chỉ xuất một JSON object hợp lệ" in SYSTEM_PROMPT
     assert "Không xuất suy luận nội bộ" in SYSTEM_PROMPT
     assert "<thought>" in SYSTEM_PROMPT
     assert "Không lặp lại hoặc tóm tắt câu hỏi" in SYSTEM_PROMPT
@@ -159,7 +159,8 @@ def test_system_prompt_enforces_grounding_and_natural_markdown():
     assert "Role:" in SYSTEM_PROMPT
     assert "Constraint:" in SYSTEM_PROMPT
     assert "Document:" in SYSTEM_PROMPT
-    assert "Citation chỉ xuất dưới dạng marker [n]" in SYSTEM_PROMPT
+    assert "source_ids" in SYSTEM_PROMPT
+    assert "Không tự viết marker trong text/cells" in SYSTEM_PROMPT
     assert SYSTEM_PROMPT.index("</response_style>") < SYSTEM_PROMPT.index("<output_contract>")
     assert SYSTEM_PROMPT.index("</output_contract>") < SYSTEM_PROMPT.rindex("<retrieved_context>")
 
@@ -240,18 +241,60 @@ def test_session_memory_max_turns():
     assert history[0]["content"] == "U1"  # First message should be U1, dropping U0 and A0
     assert history[-1]["content"] == "A5"
 
+def test_lite_ranks_beyond_neural_cap_before_expanding_and_preserves_markers(monkeypatch):
+    from src.config import settings
+    from src.ingestion.chunker import Chunk
+    from src.retrieval.fusion import HybridRetriever
+    from src.retrieval.lite_selector import LiteEvidenceSelector
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(settings, "RERANK_CANDIDATE_K", 8)
+    metadata = {"doc_id": "d", "admission_year": "2031", "campus": "BVH", "heading": "Điểm chuẩn"}
+    distractors = [(Chunk(f"noise-{i}", "Điểm chuẩn CN10", {**metadata, "campus": "BVS"}), 1.0) for i in range(12)]
+    child = Chunk("seed", "Điểm chuẩn CN1 27.5", {**metadata, "parent_chunk_id": "parent", "chunk_type": "child"})
+    parent = Chunk("parent", "Điểm chuẩn CN1 BVH 2031: 27.5", {**metadata, "chunk_type": "parent"})
+
+    class Branch:
+        def __init__(self, results):
+            self.results = results
+        def search(self, query, top_k):
+            return self.results[:top_k]
+
+    hybrid = HybridRetriever(Branch(distractors + [(child, .5)]), Branch([]), [parent.__dict__])
+    original_expand = hybrid.expand
+    hybrid.expand = MagicMock(wraps=original_expand)
+    chain = RAGChain(hybrid, MagicMock(), top_k=5, min_lexical_coverage=0, reranker=LiteEvidenceSelector())
+    prepared = chain._prepare_generation("Điểm chuẩn CN1 BVH 2031", None)
+    assert [item[0].chunk_id for item in hybrid.expand.call_args.args[1]] == ["seed"]
+    assert [source.prompt_chunk.chunk_id for source in prepared.sources] == ["parent"]
+    assert 'id="1"' in prepared.system_prompt
+    assert 'doc_id="d"' in prepared.system_prompt
+
+
+def test_lite_scope_uses_original_question_when_rewriter_drops_year():
+    from src.ingestion.chunker import Chunk
+    from src.retrieval.lite_selector import LiteEvidenceSelector
+    from unittest.mock import MagicMock
+
+    retriever = MockRetriever([Chunk("old", "Học phí năm 2030", {"admission_year": "2030"})])
+    rewriter = MagicMock()
+    rewriter.rewrite.return_value = "Học phí"
+    chain = RAGChain(retriever, MagicMock(), query_rewriter=rewriter, reranker=LiteEvidenceSelector())
+    assert chain._prepare_generation("Học phí năm 2031", None) is None
+
+
 def test_rag_chain_answer_order():
     chunks = [MockChunk(1, "Info", {"source": "file.pdf"})]
     retriever = MockRetriever(chunks)
     
     mock_llm = MagicMock()
-    mock_llm.generate.return_value = "Answer generated"
+    mock_llm.generate.return_value = "Info [1]"
     
     chain = RAGChain(retriever, mock_llm)
     
     response = chain.answer("Info?")
     
-    assert response.answer == "Answer generated"
+    assert response.answer == "Info"
     assert response.citations[0]["source"] == "file.pdf"
     assert response.route_type == "general"
     
@@ -265,9 +308,181 @@ def test_rag_chain_answer_order():
     assert "file.pdf" not in call_kwargs["messages"][0]["content"]
 
 
+@pytest.mark.parametrize(
+    "answer,expected_markers",
+    [
+        ("Only second [2]", [2]),
+        ("Duplicate [1] and again [1]", [1]),
+        ("Unknown [99]", []),
+        ("No marker", []),
+        ("Valid [2] but invalid [99]", [2]),
+    ],
+)
+def test_citations_return_only_valid_markers(answer, expected_markers):
+    chunks = [
+        MockChunk("a", "admission alpha", {"doc_id": "a", "page_number": 1}),
+        MockChunk("b", "admission beta", {"doc_id": "b", "page_number": 2}),
+    ]
+    sources = RAGChain._select_citation_sources(
+        "admission", [(chunks[0], 0.9), (chunks[1], 0.8)], preserve_order=True
+    )
+
+    citations = RAGChain._citations_for_answer(sources, answer, "admission")
+
+    assert [citation["marker"] for citation in citations] == expected_markers
+    assert [citation["chunk_id"] for citation in citations] == [
+        chunks[marker - 1].chunk_id for marker in expected_markers
+    ]
+
+
+def test_citation_collision_keeps_each_prompt_evidence_self_consistent(caplog):
+    chunks = [
+        MockChunk(
+            "collision",
+            "admission evidence from A",
+            {"doc_id": "doc-a", "page_number": 1, "source_url": "https://a.test"},
+        ),
+        MockChunk(
+            "collision",
+            "admission evidence from B",
+            {"doc_id": "doc-b", "page_number": 7, "source_url": "https://b.test"},
+        ),
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="src.generation.rag_chain"):
+        sources = RAGChain._select_citation_sources(
+            "admission evidence", [(chunks[0], 0.9), (chunks[1], 0.8)], preserve_order=True
+        )
+    citations = RAGChain._citations_for_answer(
+        sources, "Evidence A [1]. Evidence B [2].", "admission evidence"
+    )
+
+    assert len(sources) == 2
+    assert [(source.prompt_chunk.content, source.prompt_chunk.metadata["doc_id"]) for source in sources] == [
+        (chunks[0].content, "doc-a"),
+        (chunks[1].content, "doc-b"),
+    ]
+    assert [(citation["doc_id"], citation["page"], citation["source_url"]) for citation in citations] == [
+        ("doc-a", 1, "https://a.test"),
+        ("doc-b", 7, "https://b.test"),
+    ]
+    assert any(message.startswith("citation_identity_collision ") for message in caplog.messages)
+    assert "admission evidence" not in "\n".join(caplog.messages)
+
+
+@pytest.mark.parametrize("preserve_order", [False, True])
+def test_citation_representative_fields_and_score_come_from_one_member(preserve_order):
+    provenance = {
+        "doc_id": "doc",
+        "page_number": 4,
+        "heading": "Quota",
+        "table_index": 1,
+        "table_part": 1,
+        "row_start": 1,
+        "row_end": 1,
+    }
+    first = MockChunk(
+        "first",
+        "Admission quota 500",
+        {**provenance, "expansion_type": "exact"},
+    )
+    higher_score = MockChunk(
+        "higher-score",
+        " admission   QUOTA 500 ",
+        {**provenance, "expansion_type": "neighbor"},
+    )
+
+    source = RAGChain._select_citation_sources(
+        "admission quota",
+        [(first, 0.4), (higher_score, 0.9)],
+        preserve_order=preserve_order,
+    )[0]
+    expected = first if preserve_order else higher_score
+    expected_score = 0.4 if preserve_order else 0.9
+
+    assert source.prompt_chunk.chunk_id == expected.chunk_id
+    assert source.prompt_chunk.content == expected.content
+    assert source.prompt_chunk.metadata == expected.metadata
+    assert source.retrieval_score == expected_score
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_answer_paths_keep_identical_table_rows_at_distinct_locations(streaming):
+    common = {
+        "doc_id": "doc",
+        "page_number": 4,
+        "heading": "Quota",
+        "table_index": 2,
+        "chunk_type": "table",
+        "source_url": "https://example.test/quota",
+    }
+    chunks = [
+        MockChunk(
+            "part-1",
+            "admission quota | BVS | 300 |",
+            {**common, "table_part": 1, "row_start": 1, "row_end": 1},
+        ),
+        MockChunk(
+            "part-2",
+            "admission quota | BVS | 300 |",
+            {**common, "table_part": 2, "row_start": 5, "row_end": 5},
+        ),
+    ]
+    retriever = MagicMock()
+    retriever.search.return_value = [(chunks[0], 0.8), (chunks[1], 0.7)]
+    llm = MagicMock()
+    answer = "admission quota [1] [2]"
+    llm.generate.return_value = answer
+    llm.generate_stream.return_value = iter([answer])
+    chain = RAGChain(retriever, llm)
+
+    if streaming:
+        events = list(chain.answer_stream("admission quota BVS"))
+        citations = events[-1]["citations"]
+        prompt = llm.generate.call_args.kwargs["system_prompt"]
+    else:
+        response = chain.answer("admission quota BVS")
+        citations = response.citations
+        prompt = llm.generate.call_args.kwargs["system_prompt"]
+
+    assert prompt.count('<document id="') == 2
+    assert [citation["chunk_id"] for citation in citations] == ["part-1", "part-2"]
+    assert [citation["score"] for citation in citations] == [0.8, 0.7]
+
+
+def test_table_excerpt_prefers_matching_year_campus_and_value():
+    content = "\n".join(
+        [
+            "| Year | Campus | Quota |",
+            "| --- | --- | --- |",
+            "| 2025 | BVH | 500 |",
+            "| 2025 | BVS | 300 |",
+            "| 2026 | BVS | 450 |",
+        ]
+    )
+    chunk = MockChunk(
+        "table",
+        content,
+        {"doc_id": "admissions", "page_number": 4, "source_url": "https://example.test/table"},
+    )
+    sources = RAGChain._select_citation_sources(
+        "quota BVS 2026", [(chunk, 0.71)], preserve_order=True
+    )
+
+    citation = RAGChain._citations_for_answer(
+        sources, "The BVS quota for 2026 is 450 [1].", "quota BVS 2026"
+    )[0]
+
+    assert citation["snippet"] == "| 2026 | BVS | 450 |"
+    assert citation["doc_id"] == "admissions"
+    assert citation["page"] == 4
+    assert citation["source_url"] == "https://example.test/table"
+
+
 def test_rag_chain_stream_does_not_expose_model_thought_blocks():
     chunks = [MockChunk(1, "Thông tin tuyển sinh", {"source": "file.pdf"})]
     mock_llm = MagicMock()
+    mock_llm.generate.return_value = "<thought>Phân tích nội bộ</thought><final>Thông tin tuyển sinh [1]</final>"
     mock_llm.generate_stream.return_value = iter(
         [
             "<thought>Phân tích ",
@@ -280,7 +495,7 @@ def test_rag_chain_stream_does_not_expose_model_thought_blocks():
     events = list(RAGChain(MockRetriever(chunks), mock_llm).answer_stream("Thông tin tuyển sinh?"))
     visible_answer = "".join(event["text"] for event in events if event["type"] == "chunk")
 
-    assert visible_answer == "Thông tin tuyển sinh [1]"
+    assert visible_answer == "Thông tin tuyển sinh"
     assert "Phân tích nội bộ" not in visible_answer
     assert events[-1]["type"] == "metadata"
 
@@ -314,7 +529,7 @@ def test_rag_chain_cites_each_chunk_from_the_same_document_without_a_two_source_
     if streaming:
         events = list(chain.answer_stream("Thông tin tuyển sinh"))
         citations = events[-1]["citations"]
-        system_prompt = llm.generate_stream.call_args.kwargs["system_prompt"]
+        system_prompt = llm.generate.call_args.kwargs["system_prompt"]
     else:
         response = chain.answer("Thông tin tuyển sinh")
         citations = response.citations
@@ -324,26 +539,6 @@ def test_rag_chain_cites_each_chunk_from_the_same_document_without_a_two_source_
     assert [citation["chunk_id"] for citation in citations] == ["1", "2", "3", "4"]
     for index in range(1, 5):
         assert f'<document id="{index}"' in system_prompt
-
-
-@pytest.mark.parametrize("chunk_size", [1, 7, 19, 31, 200])
-@pytest.mark.parametrize("wrapper", ["final", "assistant_answer"])
-def test_rag_chain_stream_strips_closing_wrapper_across_chunk_boundaries(chunk_size, wrapper):
-    chunks = [MockChunk(1, "Thông tin tuyển sinh", {"source": "file.pdf"})]
-    answer = "Thông tin tuyển sinh [1]. " * 8
-    provider_text = f"<{wrapper}>{answer}</{wrapper}>" + "nội dung ngoài câu trả lời " * 8
-    llm = MagicMock()
-    llm.generate_stream.return_value = iter(
-        provider_text[index:index + chunk_size]
-        for index in range(0, len(provider_text), chunk_size)
-    )
-
-    events = list(RAGChain(MockRetriever(chunks), llm).answer_stream("Thông tin tuyển sinh"))
-    visible = "".join(event["text"] for event in events if event["type"] == "chunk")
-
-    assert visible == answer
-    assert events[-1]["type"] == "metadata"
-    assert events[-1]["citations"][0]["marker"] == 1
 
 
 def test_rag_chain_empty_context():
@@ -381,8 +576,8 @@ def test_rag_timing_logs_all_stages_without_query_or_content(caplog, streaming):
         ]
     )
     llm = MagicMock()
-    llm.generate.return_value = "Supported [1]"
-    llm.generate_stream.return_value = iter(["Supported [1]"])
+    llm.generate.return_value = "admission private query [1]"
+    llm.generate_stream.return_value = iter(["admission private query [1]"])
     chain = RAGChain(MockRetriever([chunk]), llm, reranker=reranker)
 
     with caplog.at_level(logging.INFO, logger="src.generation.rag_chain"):
