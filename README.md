@@ -90,16 +90,14 @@ revision, backend and distinct startup codes such as `INDEX_FINGERPRINT_MISSING`
 `COLLECTION_MISMATCH`, `MODEL_UNAVAILABLE` and `INSUFFICIENT_MEMORY`. A running
 process with `status=degraded` is not RAG ready.
 
-Lite checks citation markers, figures, entity codes, campus and textual support
-before returning an answer. SSE retains its event schema and buffers answer
-text until validation passes. Unsupported generated answers return
-`GENERATION_UNGROUNDED` (502), distinct from retrieval unavailability (503).
-Soft-wrapped lines form one paragraph; a closing citation must support every
-claim in it. Each list item and table data row needs its own supported citation.
-Lite JSON and SSE use the same complete provider response and grounding checks;
-SSE emits the validated answer and citation metadata after those checks pass.
-These conservative checks are not semantic entailment. Questions requiring
-current inventory/availability abstain because the corpus is static.
+JSON and SSE use the same provider response and presentation path. Generated
+answers are returned without automatic factual, semantic or citation-support
+validation. Source references are optional and map to real retrieved metadata
+when present; absent or invalid reference IDs do not reject the answer.
+Empty responses and malformed structured JSON return `INVALID_GENERATION`
+(502), while retrieval unavailability remains a separate 503 error. Questions
+requiring current inventory/availability abstain because the corpus is static.
+See [answer generation and citations](docs/chat-generation-and-citations.md).
 
 Run tests and actual BM25 golden evaluation without starting an API:
 

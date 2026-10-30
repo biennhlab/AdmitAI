@@ -48,7 +48,7 @@ class LiteEvidenceSelector:
 
     The selector filters scope conflicts and reorders existing candidates. It returns the original chunk
     objects and retrieval scores so provenance and downstream citation identity are
-    preserved. Grounding/abstention remains the responsibility of ``RAGChain``.
+    preserved. Answer generation remains the responsibility of ``RAGChain``.
     """
 
     @staticmethod
@@ -59,6 +59,10 @@ class LiteEvidenceSelector:
         every seed. Only already retrieved, scope-eligible evidence is considered;
         no method names, source IDs or expected number of methods are supplied.
         """
+        from .program_catalog import catalog_seeds, is_program_overview
+
+        if is_program_overview(query):
+            return catalog_seeds(query, ranked, top_k)
         text = normalize(query)
         overview = (
             "phuong thuc" in text

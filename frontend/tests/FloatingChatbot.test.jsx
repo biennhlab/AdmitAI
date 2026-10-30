@@ -174,8 +174,8 @@ describe('FloatingChatbot service errors', () => {
   });
 
   it.each([
-    ['điểm chuẩn cn1', 'GENERATION_UNGROUNDED', false],
-    ['Điểm chuẩn ngành Công nghệ thông tin mã 7480201 năm 2026 là bao nhiêu?', 'GENERATION_UNGROUNDED', false],
+    ['điểm chuẩn cn1', 'INVALID_GENERATION', false],
+    ['Điểm chuẩn ngành Công nghệ thông tin mã 7480201 năm 2026 là bao nhiêu?', 'INVALID_GENERATION', false],
     ['Học phí PTIT năm học 2026–2027 là bao nhiêu?', 'LLM_PROVIDER_ERROR', false]
   ])('keeps the exact failed question safe: %s', async (question, code, unavailable) => {
     global.fetch = vi.fn()
@@ -199,7 +199,7 @@ describe('FloatingChatbot service errors', () => {
     expect(container.textContent).toContain(unavailable
       ? 'Dịch vụ tư vấn đang tạm thời chưa sẵn sàng.'
       : code === 'LLM_PROVIDER_ERROR' ? 'Dịch vụ tư vấn đang tạm thời chưa sẵn sàng.'
-        : 'Mình chưa thể xác minh câu trả lời từ nguồn tuyển sinh hiện có.');
+        : 'Phản hồi từ dịch vụ xử lý không hợp lệ.');
     if (unavailable) expect(input).toBeDisabled();
     else expect(input).toBeEnabled();
   });

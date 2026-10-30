@@ -19,26 +19,26 @@ function streamResponse(parts, cancel = vi.fn()) {
 describe('chat SSE parsing', () => {
   it.each([parseChatResponse, parseChatStream])('keeps a safe request ID with the structured API rejection', async (parse) => {
     const id = '1234567890abcdef1234567890abcdef';
-    const response = Response.json({ detail: { code: 'GENERATION_UNGROUNDED' } }, {
+    const response = Response.json({ detail: { code: 'INVALID_GENERATION' } }, {
       status: 502, headers: { 'x-request-id': id }
     });
-    await expect(parse(response)).rejects.toMatchObject({ code: 'GENERATION_UNGROUNDED', status: 502, requestId: id });
+    await expect(parse(response)).rejects.toMatchObject({ code: 'INVALID_GENERATION', status: 502, requestId: id });
   });
-  it('explains unsupported generation without marking retrieval unavailable', () => {
-    const error = { code: 'GENERATION_UNGROUNDED' };
-    expect(friendlyChatError(error)).toContain('chưa thể xác minh');
+  it('explains malformed generation without marking retrieval unavailable', () => {
+    const error = { code: 'INVALID_GENERATION' };
+    expect(friendlyChatError(error)).toContain('không hợp lệ');
     expect(marksServiceUnavailable(error)).toBe(false);
   });
 
-  it('handles a grounding SSE rejection without displaying answer chunks', async () => {
+  it('handles a format SSE error without displaying answer chunks', async () => {
     const onChunk = vi.fn();
     const onMetadata = vi.fn();
     const response = streamResponse([
-      'event: error\ndata: {"code":"GENERATION_UNGROUNDED","message":"Cannot verify"}\n\n'
+      'event: error\ndata: {"code":"INVALID_GENERATION","message":"Cannot verify"}\n\n'
     ]);
 
     await expect(parseChatStream(response, onChunk, onMetadata)).rejects.toMatchObject({
-      code: 'GENERATION_UNGROUNDED'
+      code: 'INVALID_GENERATION'
     });
     expect(onChunk).not.toHaveBeenCalled();
     expect(onMetadata).not.toHaveBeenCalled();

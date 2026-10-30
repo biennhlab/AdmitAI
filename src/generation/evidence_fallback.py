@@ -1,8 +1,7 @@
 """Narrow extractive recovery for a complete, explicitly numbered methods list.
 
 No model calls, retrieval, guessed sources or paraphrased facts. Any missing,
-conflicting or out-of-scope evidence declines recovery. The caller must still
-run the normal factual/relational validator before presenting the result.
+conflicting or out-of-scope source data declines extractive recovery.
 """
 import re
 from urllib.parse import urlsplit
@@ -72,3 +71,67 @@ def admission_methods(question: str, chunks: list) -> str | None:
         return None
     return '\n'.join(f'- {methods[number][0]} [{methods[number][1]}].'
                      for number in range(1, total + 1))
+
+
+def program_catalog(question: str, chunks: list) -> str | None:
+    """Render every name/application-code row of proven complete source tables."""
+    from src.retrieval.program_catalog import complete_catalog
+
+    families = {}
+    for chunk in chunks:
+        metadata = chunk.metadata or {}
+        key = (metadata.get('doc_id'), metadata.get('table_index'))
+        families.setdefault(key, []).append(chunk)
+    catalog = complete_catalog(question, families.values())
+    if catalog is None:
+        return None
+    markers = {chunk.chunk_id: index for index, chunk in enumerate(chunks, 1)}
+    selected_ids = {part.chunk_id for table in catalog for part in table.parts}
+    if len(markers) != len(chunks) or selected_ids != set(markers):
+        return None
+    lines = []
+    for table in catalog:
+        campus = 'Hà Nội' if table.campus == 'BVH' else 'TP. Hồ Chí Minh'
+        lines.extend([f'### Ngành và chương trình tuyển sinh năm {table.year} — cơ sở {campus}', ''])
+        previous = ()
+        for entry in table.entries:
+            for depth, section in enumerate(entry.sections):
+                if depth >= len(previous) or section != previous[depth]:
+                    label, chunk_id = section
+                    if lines and lines[-1]:
+                        lines.append('')
+                    lines.extend([f'{"#" * (4 + depth)} {label} [{markers[chunk_id]}]', ''])
+            previous = entry.sections
+            lines.append(f'- Ngành **{entry.name}**, mã xét tuyển **{entry.code}** [{markers[entry.chunk_id]}].')
+        lines.append('')
+    return '\n'.join(lines).strip()
+
+
+def program_profile(catalog, chunks: list) -> str | None:
+    """Copy every source field of each matched program, with per-row attribution."""
+    markers = {chunk.chunk_id: index for index, chunk in enumerate(chunks, 1)}
+    if len(markers) != len(chunks):
+        return None
+    lines = []
+    for table in catalog:
+        campus = 'Hà Nội' if table.campus == 'BVH' else 'TP. Hồ Chí Minh'
+        lines.extend([f'### Tuyển sinh năm {table.year} — cơ sở {campus}', ''])
+        for entry in table.entries:
+            if entry.chunk_id not in markers or not entry.fields:
+                return None
+            for label, chunk_id in entry.sections:
+                if chunk_id not in markers:
+                    return None
+                lines.extend([f'**{label}** [{markers[chunk_id]}].', ''])
+            labels, values = zip(*entry.fields)
+            if any(re.search(r'[<>\[\]\\\x00-\x1f\x7f]|https?://', value)
+                   for value in (*labels, *values)):
+                return None
+            marker = markers[entry.chunk_id]
+            labels, values = list(labels), list(values)
+            labels[-1] += f' [{marker}]'
+            values[-1] += f' [{marker}]'
+            lines.extend(['| ' + ' | '.join(labels) + ' |',
+                          '| ' + ' | '.join(['---'] * len(labels)) + ' |',
+                          '| ' + ' | '.join(values) + ' |', ''])
+    return '\n'.join(lines).strip() or None

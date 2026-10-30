@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from types import SimpleNamespace
 import json as jsonlib
@@ -829,6 +830,7 @@ async def test_health_never_reloads_models_after_memory_failure(kind):
         patch("api.main.load_local_index", return_value=([], manifest)),
         patch("api.main.load_hybrid_retriever", side_effect=build_hybrid_retriever) as loader,
         patch("api.main.QdrantClient") as client_factory,
+        patch("src.retrieval.embedder.snapshot_download", return_value="cached-test-model"),
         patch("src.retrieval.embedder.SentenceTransformer", side_effect=error) as model_factory,
     ):
         client_factory.return_value.count.return_value.count = 0
@@ -857,6 +859,7 @@ def test_hybrid_initializes_sentence_transformer_despite_low_or_unknown_memory(m
         patch("api.main.QdrantClient") as client_factory,
         patch("api.main.QdrantDenseSearch") as dense_factory,
         patch("api.main.BM25Search"),
+        patch("src.retrieval.embedder.snapshot_download", return_value="cached-test-model"),
         patch("src.retrieval.embedder.SentenceTransformer") as model_factory,
     ):
         client = client_factory.return_value
@@ -865,7 +868,7 @@ def test_hybrid_initializes_sentence_transformer_despite_low_or_unknown_memory(m
         model_factory.return_value.get_sentence_embedding_dimension.return_value = 1024
         result_client, _, result_manifest = build_hybrid_retriever([], manifest)
     model_factory.assert_called_once_with(
-        chat.settings.EMBEDDING_MODEL,
+        str(Path("cached-test-model").resolve()),
         cache_folder=chat.settings.HUGGINGFACE_CACHE_DIR,
         local_files_only=True,
     )
@@ -885,23 +888,6 @@ async def test_health_recovery_transient_failure_has_cooldown():
         await health_check()
     assert loader.call_count == 1
     assert app.state.rag_recovery["blocked"] is False
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
-async def test_lite_rejects_ungrounded_generated_figures_before_any_transport_output(accept):
-    from src.ingestion.chunker import Chunk
-    from src.retrieval.lite_selector import LiteEvidenceSelector
-    retriever = MagicMock()
-    retriever.search.return_value = [(Chunk("sat", "Điểm SAT tối thiểu là 1130/1600.", {"doc_id": "d", "page_number": 1}), .02)]
-    llm = MagicMock()
-    llm.generate.return_value = "Điểm SAT tối thiểu là 9999 [1]."
-    llm.generate_stream.return_value = iter(["Điểm SAT tối thiểu là ", "9999 [1]."])
-    chat.rag_chain = RAGChain(retriever, llm, min_lexical_coverage=0, reranker=LiteEvidenceSelector())
-    response = await request("POST", "/api/chat", json={"message": "Điểm SAT tối thiểu?"}, headers={"Accept": accept})
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "GENERATION_UNGROUNDED"
-    assert "9999" not in response.text
 
 
 @pytest.mark.asyncio
@@ -932,67 +918,6 @@ async def test_lite_markdown_preserves_answer_and_source_mapping_in_json_and_sse
     assert citation["doc_id"] == "admission"
     assert citation["page"] == 7
     assert citation["source_url"] == "https://example.test/admission"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
-@pytest.mark.parametrize("answer", [
-    "Điểm SAT 1130 [99].",
-    "Điểm SAT 1130.\n\nĐiểm SAT 1130 [1].",
-    "- Điểm SAT 1130\n- Điểm SAT 1130 [1].",
-    "| SAT | 1130 |\n| SAT | 1130 [1] |",
-])
-async def test_lite_rejection_exposes_no_unvalidated_text_or_partial_persistence(accept, answer):
-    from src.ingestion.chunker import Chunk
-    from src.retrieval.lite_selector import LiteEvidenceSelector
-
-    retriever, llm, db = MagicMock(), MagicMock(), FakeDB()
-    retriever.search.return_value = [(Chunk("sat", "Điểm SAT tối thiểu là 1130/1600.", {"doc_id": "d"}), .02)]
-    llm.generate.return_value = answer
-    llm.generate_stream.return_value = iter([answer[:12], answer[12:]])
-    chat.rag_chain = RAGChain(retriever, llm, min_lexical_coverage=0, reranker=LiteEvidenceSelector())
-    response = await request("POST", "/api/chat", json={"message": "Điểm SAT?"}, db=db, headers={"Accept": accept})
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "GENERATION_UNGROUNDED"
-    assert "1130" not in response.text
-    assert not db.commit_called
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
-@pytest.mark.parametrize("supported", [True, False])
-@pytest.mark.parametrize("content,question,correct,swapped", [
-    ("Học phí đại trà 35,9 triệu/năm. Học phí chất lượng cao 58,3 triệu/năm.",
-     "Học phí đại trà?", "Học phí đại trà 35,9 triệu/năm [1].", "Học phí đại trà 58,3 triệu/năm [1]."),
-    ("Điểm SAT tối thiểu 1130/1600 hoặc ACT tối thiểu 25/36.",
-     "Điểm SAT tối thiểu?", "Điểm SAT tối thiểu 1130/1600 [1].", "Điểm SAT tối thiểu 25/36 [1]."),
-    ("Học phí đại trà năm 2025 là 35,9 triệu. Học phí đại trà năm 2026 là 40,7 triệu.",
-     "Học phí đại trà?", "Học phí đại trà năm 2026 là 40,7 triệu [1].", "Học phí đại trà năm 2026 là 35,9 triệu [1]."),
-])
-async def test_relational_grounding_accepts_supported_and_blocks_swapped_json_sse(
-    accept, supported, content, question, correct, swapped,
-):
-    from src.ingestion.chunker import Chunk
-    from src.retrieval.lite_selector import LiteEvidenceSelector
-
-    retriever, llm, db = MagicMock(), MagicMock(), FakeDB()
-    retriever.search.return_value = [(Chunk("relation", content, {"doc_id": "relation-doc"}), .02)]
-    answer = correct if supported else swapped
-    llm.generate.return_value = answer
-    llm.generate_stream.return_value = iter([answer])
-    chat.rag_chain = RAGChain(retriever, llm, min_lexical_coverage=0, reranker=LiteEvidenceSelector())
-    response = await request("POST", "/api/chat", json={"message": question}, db=db, headers={"Accept": accept})
-    if supported:
-        assert response.status_code == 200
-        payload = response_payload(response, accept)
-        assert payload["answer"] == correct.replace(" [1]", "")
-        assert payload["citations"][0]["chunk_id"] == "relation"
-        assert payload["citations"][0]["marker"] == 1
-    else:
-        assert response.status_code == 503
-        assert response.json()["detail"]["code"] == "GENERATION_UNGROUNDED"
-        assert swapped not in response.text
-        assert not db.commit_called
 
 
 def _abstention_chain(output):
@@ -1065,42 +990,6 @@ async def test_allowlisted_abstention_variants_are_canonicalized_in_both_transpo
     payload = response_payload(response, accept)
     assert payload["answer"] == FALLBACK_ANSWER
     assert payload["route_type"] == "out_of_scope" and payload["citations"] == []
-    llm.generate.assert_called_once()
-    llm.generate_stream.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("accept", ["application/json", "text/event-stream"])
-@pytest.mark.parametrize("output", [
-    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. Học phí đại trà 58,3 triệu/năm [1].",
-    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. Điểm SAT tối thiểu 9999 [1].",
-    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. Ngành Thú y được tuyển sinh [1].",
-    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. [99]",
-    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. [1]",
-    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có. Bạn hãy thử lại.",
-    "<|channel|analysis>Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.",
-    "<analysis>PRIVATE_INTERNAL</analysis>Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.",
-    "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.<|turn|>",
-    "<answer>Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.",
-    "<answer>Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.</final>",
-    "<analysis>PRIVATE_INTERNAL</analysis>",
-    "\x85Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có.",
-    "", " \n\t", None, 123, {}, [],
-])
-async def test_unsafe_abstention_outputs_reject_before_stream_and_session_persistence(accept, output, caplog):
-    from src.generation.rag_chain import FALLBACK_ANSWER
-
-    chain, llm = _abstention_chain(output)
-    chat.rag_chain = chain
-    db = FakeDB()
-    response = await request("POST", "/api/chat", json={"message": "Điểm SAT tối thiểu?"}, db=db, headers={"Accept": accept})
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "GENERATION_UNGROUNDED"
-    assert "data:" not in response.text and "event: error" not in response.text
-    assert FALLBACK_ANSWER not in response.text and "PRIVATE_INTERNAL" not in response.text
-    assert not db.commit_called and db.records == []
-    assert all(history == [] for history in chat.session_memory.sessions.values())
-    assert "PRIVATE_INTERNAL" not in caplog.text
     llm.generate.assert_called_once()
     llm.generate_stream.assert_not_called()
 

@@ -17,43 +17,25 @@ from ..query_transform import AbbreviationNormalizer, QueryRewriter
 from ..retrieval.document import chunk_search_text
 from ..retrieval.lite_selector import LiteEvidenceSelector
 from .prompts import SYSTEM_PROMPT, build_rag_prompt, format_citations
-from .grounding import RAGGroundingError, logical_claims, validate_answer
 from .diagnostics import generation_diagnostics, record_generation
 from .llm_client import LLMAuthenticationError, LLMProviderError
+from .structured_answer import GenerationFormatError, render_structured_answer
 
 
 FALLBACK_ANSWER = "Mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh hiện có."
 logger = logging.getLogger(__name__)
 
-# Whole-answer allowlist, not a prefix or intent classifier. Every other lite
-# answer still goes through the unchanged factual/relational validator.
-_PURE_ABSTENTIONS = frozenset(text.casefold() for text in (
+_ABSTENTIONS = frozenset(text.casefold() for text in (
     FALLBACK_ANSWER.removesuffix("."),
     "Mình chưa có đủ thông tin trong dữ liệu tuyển sinh hiện có để trả lời câu hỏi này",
     "Mình chưa có đủ bằng chứng trong dữ liệu tuyển sinh hiện có để trả lời câu hỏi này",
 ))
 
 
-def _is_safe_abstention(answer: str, raw_answer: str) -> bool:
-    """Allow three exact forms after cleanup, with no extra content or controls.
-
-    NFC, case and whitespace differences and one optional final period are
-    allowed. The raw output must be plain text or one balanced answer wrapper;
-    hidden/internal blocks, malformed/nested wrappers and extra text fail closed.
-    """
-    if any(unicodedata.category(char).startswith("C") and char not in "\t\r\n" for char in raw_answer):
-        return False
+def _is_abstention(answer: str) -> bool:
+    """Normalize legacy refusal wording without rejecting other responses."""
     canonical = " ".join(unicodedata.normalize("NFC", answer).split()).casefold()
-    if canonical.removesuffix(".") not in _PURE_ABSTENTIONS:
-        return False
-    if raw_answer.strip() == answer:
-        return True
-    wrapper = re.fullmatch(
-        r"\s*<(?P<tag>assistant_answer|answer|response|final)>\s*"
-        r"(?P<body>.*?)\s*</(?P=tag)>\s*",
-        raw_answer, flags=re.IGNORECASE | re.DOTALL,
-    )
-    return wrapper is not None and wrapper["body"].strip() == answer
+    return canonical.removesuffix('.') in _ABSTENTIONS
 
 
 class RAGRetrievalError(RuntimeError):
@@ -96,10 +78,11 @@ class _GenerationInput:
     sources: list[_CitationSource]
     system_prompt: str
     messages: list[dict[str, str]]
+    evidence_answer: str | None = None
 
 
 class RAGChain:
-    """Retrieve, ground generation, and return citations from real metadata."""
+    """Retrieve context, generate an answer, and present available citations."""
 
     def __init__(
         self,
@@ -126,6 +109,11 @@ class RAGChain:
     def _retrieval_query(self, question: str) -> str:
         """Normalize verified abbreviations, then optionally rewrite for search."""
         normalized = self.abbreviation_normalizer.normalize(question)
+        if isinstance(self.reranker, LiteEvidenceSelector):
+            from ..retrieval.program_catalog import is_program_overview
+
+            if is_program_overview(question):
+                normalized += " tên ngành mã ngành"
         if self.query_rewriter is None:
             return normalized
         return self.query_rewriter.rewrite(normalized)
@@ -241,6 +229,39 @@ class RAGChain:
             from ..retrieval.domain_signals import requires_live_availability
             if requires_live_availability(question):
                 return None
+        from ..retrieval.program_catalog import (
+            complete_catalog, is_program_overview, named_program_query, named_program_catalog,
+        )
+        from ..retrieval.fusion import HybridRetriever
+        overview = is_program_overview(question)
+        if overview or (isinstance(self.retriever, HybridRetriever)
+                        and named_program_query(question) is not None):
+            from .evidence_fallback import program_catalog, program_profile
+
+            if not isinstance(self.retriever, HybridRetriever):
+                return None
+            # The loaded structural table index contains the complete source,
+            # independent of search top-k and the LLM context/output budgets.
+            select_catalog = complete_catalog if overview else named_program_catalog
+            catalog = select_catalog(question, self.retriever.table_chunks_by_doc_and_index.values())
+            if catalog is None:
+                logger.info("catalog_coverage status=unverified")
+                return None
+            logger.info("catalog_coverage status=complete year=%d tables=%d parts=%d entries=%d",
+                        catalog[0].year, len(catalog), sum(len(table.parts) for table in catalog),
+                        sum(len(table.entries) for table in catalog))
+            parts = [part for table in catalog for part in table.parts]
+            if not overview:
+                needed = {entry.chunk_id for table in catalog for entry in table.entries}
+                needed.update(chunk_id for table in catalog for entry in table.entries
+                              for _, chunk_id in entry.sections)
+                parts = [part for part in parts if part.chunk_id in needed]
+            sources = self._select_citation_sources(question, [(part, 0.0) for part in parts], preserve_order=True)
+            chunks = [source.prompt_chunk for source in sources]
+            evidence = program_catalog(question, chunks) if overview else program_profile(catalog, chunks)
+            if evidence is None:
+                return None
+            return _GenerationInput(sources, '', [], evidence_answer=evidence)
         query_started_at = time.perf_counter()
         try:
             retrieval_query = self._retrieval_query(question)
@@ -551,7 +572,9 @@ class RAGChain:
 
     @staticmethod
     def _claim_for_marker(answer: str, marker: int) -> str:
-        return " ".join(claim.text for claim in logical_claims(answer) if marker in claim.markers)
+        # Excerpt selection only: reference presence does not verify a claim.
+        return ' '.join(part for part in re.split(r'\n\s*\n', answer)
+                        if marker in {int(value) for value in re.findall(r'\[(\d+)\]', part)})
 
     @staticmethod
     def _specific_excerpt_tokens(text: str) -> set[str]:
@@ -649,23 +672,15 @@ class RAGChain:
         valid_markers = {marker for marker in answer_markers if 1 <= marker <= len(sources)}
         invalid_count = sum(marker < 1 or marker > len(sources) for marker in answer_markers)
         if not answer_markers:
-            logger.warning(
-                "citation_marker_validation status=missing source_count=%d",
-                len(sources),
-            )
             return []
         if invalid_count:
-            logger.warning(
-                "citation_marker_validation status=%s source_count=%d valid_count=%d invalid_count=%d",
-                "mixed" if valid_markers else "invalid",
+            logger.debug(
+                "citation_references source_count=%d used_count=%d ignored_count=%d",
                 len(sources),
                 len(valid_markers),
                 invalid_count,
             )
-        # Structural heading markers are checked for validity, but a source
-        # must support an actual logical claim to appear in the public list.
-        used_markers = {marker for claim in logical_claims(answer) for marker in claim.markers}
-        markers = sorted(valid_markers & used_markers)
+        markers = sorted(valid_markers)
         citations: list[dict[str, Any]] = []
         for marker in markers:
             source = sources[marker - 1]
@@ -749,7 +764,7 @@ class RAGChain:
 
     @staticmethod
     def _public_answer(answer: str) -> str:
-        """Remove internal attribution only after grounding and citation selection.
+        """Remove internal attribution after citation selection.
 
         Horizontal whitespace before a marker belongs to the marker. Retain
         newlines, list indentation, table delimiters and Markdown hard breaks.
@@ -757,8 +772,7 @@ class RAGChain:
         return re.sub(r"[ \t]*\[\d+\]", "", answer).strip()
 
     def answer_stream(self, question: str, session_history: Optional[List[dict]] = None) -> Any:
-        # Every mode buffers the same one-call generation and grounding path.
-        # No provider token or internal marker reaches SSE before validation.
+        # Both transports use the same generation/rendering result.
         result = self.answer(question, session_history)
         metadata = {"type": "metadata", "citations": result.citations, "route_type": result.route_type}
         if result.answer_mode != "generated":
@@ -787,6 +801,14 @@ class RAGChain:
             answer = ""
             classification = "provider_error"
             try:
+                if prepared.evidence_answer is not None:
+                    classification = "complete_catalog"
+                    answer = prepared.evidence_answer
+                    citations = self._citations_for_answer(prepared.sources, answer, question)
+                    for citation in citations:
+                        citation['score'] = None  # Structural lookup has no retrieval-ranking score.
+                    record_generation(prepared.sources, answer, classification)
+                    return RAGResponse(self._public_answer(answer), citations, "general", "evidence")
                 with self._timed_stage("generation"):
                     try:
                         raw_answer = self.llm_client.generate(
@@ -798,77 +820,53 @@ class RAGChain:
                         if recovered is not None:
                             record_generation(prepared.sources, "", "provider_error", error=exc)
                             used_markers = " ".join(f"[{c['marker']}]" for c in recovered.citations)
-                            record_generation(prepared.sources, used_markers, "verified_evidence_recovery")
+                            record_generation(prepared.sources, used_markers, "extractive_evidence_recovery")
                             return recovered
                         raise
                     classification = "invalid_generation"
                     if not isinstance(raw_answer, str):
-                        raise RAGGroundingError(
-                            "Generation did not return text", reason="invalid_generation",
-                            source_count=len(prepared.sources),
-                        )
+                        raise GenerationFormatError('Generation did not return text')
                     answer = self._clean_answer(raw_answer)
 
-                if _is_safe_abstention(answer, raw_answer):
-                    record_generation(prepared.sources, answer, "safe_abstention")
+                if _is_abstention(answer):
+                    record_generation(prepared.sources, answer, "legacy_abstention")
                     return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
-                classification = "factual_candidate"
+                candidate = answer
+                # A JSON source_ids array is not an inline citation marker in
+                # diagnostics. Only rendered, schema-checked text is attributed.
+                answer = ""
+                structured = render_structured_answer(candidate, len(prepared.sources))
+                if structured is not None:
+                    if structured.abstained:
+                        record_generation(prepared.sources, "", "structured_abstention")
+                        return RAGResponse(FALLBACK_ANSWER, [], "out_of_scope")
+                    answer = structured.text
+                else:
+                    answer = candidate
+                classification = "structured_candidate" if structured is not None else "factual_candidate"
                 if not answer.strip():
                     classification = "empty_generation"
-                elif re.match(r"(?:mình )?(?:chưa|không) (?:tìm thấy|có đủ|thể xác minh)", answer.casefold()):
-                    classification = "abstention_candidate"
-                envelope = re.sub(r"\A\s*<(thought|analysis|reasoning)>.*?</\1>\s*", "", raw_answer,
-                                  flags=re.IGNORECASE | re.DOTALL)
-                if re.match(r"\s*<(?:assistant_answer|answer|response|final)>", envelope, re.IGNORECASE):
-                    if not re.fullmatch(r"\s*<(?P<tag>assistant_answer|answer|response|final)>.*?</(?P=tag)>\s*",
-                                        envelope, re.IGNORECASE | re.DOTALL):
-                        classification = "invalid_output"
-                        raise RAGGroundingError("Malformed answer wrapper", reason="invalid_generation",
-                                                source_count=len(prepared.sources))
-                # Cleanup may remove known outer wrappers, but residual controls,
-                # invented links and separate source footers are not factual text.
-                if re.search(
-                    r"<[^>]*>|https?://|\[[^\]]*\]\([^)]*\)|(?m:^\s*\[[^\]]+\]:\s*\S)"
-                    r"|\\\[\d+\\?\]|\[\d+\\\]"
-                    r"|(?im:^\s*(?:assistant|system|analysis|reasoning|thought)\s*:)"
-                    r"|(?im:^\s*(?:#+\s*)?(?:nguồn tham khảo|sources|references)\s*:?(?:\s|$))",
-                    answer,
-                ):
-                    classification = "invalid_output"
-                    raise RAGGroundingError(
-                        "Generation contains internal controls or a source footer/link",
-                        reason="invalid_generation", source_count=len(prepared.sources),
-                    )
-                validate_answer(answer, [source.prompt_chunk for source in prepared.sources])
+                    raise GenerationFormatError('Generation returned an empty answer')
                 citations = self._citations_for_answer(prepared.sources, answer, question)
                 record_generation(prepared.sources, answer, classification)
                 return RAGResponse(self._public_answer(answer), citations, "general")
             except Exception as exc:
                 record_generation(prepared.sources, answer, classification, error=exc)
-                if isinstance(exc, RAGGroundingError) and exc.reason == "missing_citation":
-                    # Discard the model answer; never attach guessed markers to
-                    # its uncited claims. A separate source-only answer must
-                    # independently pass the same factual/relational validator.
-                    recovered = self._evidence_recovery(question, prepared)
-                    if recovered is not None:
-                        used_markers = " ".join(f"[{c['marker']}]" for c in recovered.citations)
-                        record_generation(prepared.sources, used_markers, "verified_citation_format_recovery")
-                        return recovered
                 raise
 
     def _evidence_recovery(self, question: str, prepared: _GenerationInput) -> RAGResponse | None:
-        from .evidence_fallback import admission_methods
+        from .evidence_fallback import admission_methods, program_catalog
 
         try:
             chunks = [source.prompt_chunk for source in prepared.sources]
             answer = admission_methods(question, chunks)
             if answer is None:
+                answer = program_catalog(question, chunks)
+            if answer is None:
                 return None
-            validate_answer(answer, chunks)
             citations = self._citations_for_answer(prepared.sources, answer, question)
             return RAGResponse(self._public_answer(answer), citations, "general", "evidence")
         except Exception as exc:
-            # A failed recovery never masks the original generation failure or
-            # permits an unverified excerpt through either transport.
+            # A failed extractive recovery retains the original provider error.
             logger.warning("Evidence recovery declined error_class=%s", type(exc).__name__)
             return None

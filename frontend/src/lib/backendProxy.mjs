@@ -6,7 +6,7 @@ const PUBLIC_MESSAGES = {
   BACKEND_TIMEOUT: "Dịch vụ tư vấn đang mất nhiều thời gian hơn dự kiến.",
   INVALID_BACKEND_RESPONSE: "Dịch vụ tư vấn trả về phản hồi không hợp lệ.",
   RAG_UNAVAILABLE: "Dịch vụ tư vấn đang tạm thời chưa sẵn sàng.",
-  GENERATION_UNGROUNDED: "Chưa thể xác minh câu trả lời từ nguồn tuyển sinh hiện có.",
+  INVALID_GENERATION: "Dịch vụ xử lý trả về phản hồi không hợp lệ.",
   LLM_TIMEOUT: "Yêu cầu xử lý mất nhiều thời gian hơn dự kiến.",
   LLM_AUTHENTICATION_FAILED:
     "Dịch vụ xử lý câu hỏi đang tạm thời chưa sẵn sàng.",

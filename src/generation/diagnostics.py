@@ -31,7 +31,6 @@ def record_generation(sources, answer, classification, *, error=None):
         **(_request.get() or {}), 'provider_response_class': classification,
         'outcome': 'rejected' if error else 'accepted',
         'reason': getattr(error, 'reason', getattr(error, 'code', None)),
-        'claim_index': getattr(error, 'claim_index', None),
         'error_class': type(error).__name__ if error else None,
         'selected_source_ids': list(mapping.values()),
         'citation_mapping': mapping, 'answer_markers': markers,

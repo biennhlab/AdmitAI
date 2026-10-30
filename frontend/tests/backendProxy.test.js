@@ -10,7 +10,7 @@ describe('controlled backend proxy', () => {
       ? new Response('data: {"type":"chunk","text":"Verified"}\n\n', {
         headers: { 'content-type': 'text/event-stream', 'x-request-id': id }
       })
-      : Response.json(kind === 'error' ? { detail: { code: 'GENERATION_UNGROUNDED' } } : { answer: 'Verified' }, {
+      : Response.json(kind === 'error' ? { detail: { code: 'INVALID_GENERATION' } } : { answer: 'Verified' }, {
         status: kind === 'error' ? 502 : 200, headers: { 'x-request-id': id }
       });
     const response = await proxyBackend('/api/chat', { fetchImpl: vi.fn().mockResolvedValue(upstream), timeoutMs: 100 });
@@ -82,16 +82,16 @@ describe('controlled backend proxy', () => {
     expect(JSON.stringify(payload)).not.toContain('secret internal path');
   });
 
-  it('preserves generation grounding failure separately from retrieval errors', async () => {
+  it('preserves generation format failure separately from retrieval errors', async () => {
     const response = await proxyBackend('/api/chat', {
       fetchImpl: vi.fn().mockResolvedValue(Response.json(
-        { detail: { code: 'GENERATION_UNGROUNDED', message: 'internal unsupported output' } },
+        { detail: { code: 'INVALID_GENERATION', message: 'internal unsupported output' } },
         { status: 502 }
       )), timeoutMs: 100
     });
     expect(response.status).toBe(503);
     const payload = await response.json();
-    expect(payload.error.code).toBe('GENERATION_UNGROUNDED');
+    expect(payload.error.code).toBe('INVALID_GENERATION');
     expect(JSON.stringify(payload)).not.toContain('internal unsupported output');
   });
 

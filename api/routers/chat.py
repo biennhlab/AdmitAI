@@ -25,7 +25,8 @@ from src.generation.llm_client import (
     LLMRateLimitError,
     LLMTimeoutError,
 )
-from src.generation.rag_chain import RAGChain, RAGRetrievalError, RAGGroundingError
+from src.generation.rag_chain import RAGChain, RAGRetrievalError
+from src.generation.structured_answer import GenerationFormatError
 from src.generation.diagnostics import generation_diagnostics
 from src.generation.session_memory import SessionMemory
 from src.query_transform import AbbreviationNormalizer, QueryRewriter
@@ -82,12 +83,8 @@ def _generation_http_error(exc: Exception, request_id: str | None = None) -> HTT
 
 def _classify_generation_error(exc: Exception) -> HTTPException:
     """Use the same public error classification before and during a stream."""
-    if isinstance(exc, RAGGroundingError):
-        logger.warning(
-            "Chat grounding rejected reason=%s claim_index=%d citation_present=%s source_count=%d",
-            exc.reason, exc.claim_index, exc.citation_present, exc.source_count,
-        )
-        return _service_error(503, exc.code, "Chưa thể xác minh câu trả lời từ nguồn tuyển sinh hiện có.")
+    if isinstance(exc, GenerationFormatError):
+        return _service_error(502, exc.code, 'Dịch vụ xử lý trả về phản hồi không hợp lệ.')
     _log_queued_exception("Chat generation dependency failed", exc)
     if isinstance(exc, LLMTimeoutError):
         return _service_error(504, exc.code, LLM_TIMEOUT_MESSAGE)

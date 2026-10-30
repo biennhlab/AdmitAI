@@ -41,8 +41,8 @@ export async function parseChatResponse(response) {
 
 export function friendlyChatError(error, isOnline = true) {
   if (!isOnline) return 'Có vẻ kết nối mạng đang gặp vấn đề.';
-  if (error?.code === 'GENERATION_UNGROUNDED') {
-    return 'Mình chưa thể xác minh câu trả lời từ nguồn tuyển sinh hiện có. Bạn thử diễn đạt lại câu hỏi nhé.';
+  if (error?.code === 'INVALID_GENERATION') {
+    return 'Phản hồi từ dịch vụ xử lý không hợp lệ. Bạn thử gửi lại câu hỏi nhé.';
   }
   if (TIMEOUT_CODES.has(error?.code)) {
     return 'Mình đang mất nhiều thời gian hơn bình thường để xử lý câu hỏi này. Bạn thử lại giúp mình nhé.';
@@ -60,7 +60,7 @@ export function marksServiceUnavailable(error) {
 
 export function canRetryChatError(error) {
   return ['LLM_PROVIDER_ERROR', 'LLM_UNAVAILABLE', 'LLM_RATE_LIMITED',
-    'LLM_TIMEOUT', 'BACKEND_TIMEOUT'].includes(error?.code);
+    'LLM_TIMEOUT', 'BACKEND_TIMEOUT', 'INVALID_GENERATION'].includes(error?.code);
 }
 
 export async function parseChatStream(response, onChunk, onMetadata) {

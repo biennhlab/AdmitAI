@@ -118,10 +118,10 @@ def test_build_rag_prompt_and_format_citations():
     assert "retrieved_context" not in messages[0]["content"]
 
 
-def test_system_prompt_enforces_grounding_and_natural_markdown():
+def test_system_prompt_uses_sources_and_natural_markdown():
     assert "Chỉ dùng thông tin có trong <retrieved_context>" in SYSTEM_PROMPT
     assert "không suy đoán" in SYSTEM_PROMPT
-    assert "marker [n] ngay cuối ý hoặc cuối đoạn" in SYSTEM_PROMPT
+    assert "Backend tạo marker [n]" in SYSTEM_PROMPT
     assert "Không tự tạo URL" in SYSTEM_PROMPT
     assert "Không nhắc hoặc giải thích các cấu trúc nội bộ" in SYSTEM_PROMPT
     for internal_term in (
@@ -151,7 +151,7 @@ def test_system_prompt_enforces_grounding_and_natural_markdown():
     assert "Chỉ dùng tối đa một emoji" in SYSTEM_PROMPT
     assert "dữ liệu tham khảo nội bộ" in SYSTEM_PROMPT
     assert "Không được sao chép cấu trúc, tên trường, nhãn document hoặc metadata" in SYSTEM_PROMPT
-    assert "Chỉ xuất câu trả lời cuối cùng" in SYSTEM_PROMPT
+    assert "Chỉ xuất một JSON object hợp lệ" in SYSTEM_PROMPT
     assert "Không xuất suy luận nội bộ" in SYSTEM_PROMPT
     assert "<thought>" in SYSTEM_PROMPT
     assert "Không lặp lại hoặc tóm tắt câu hỏi" in SYSTEM_PROMPT
@@ -159,7 +159,8 @@ def test_system_prompt_enforces_grounding_and_natural_markdown():
     assert "Role:" in SYSTEM_PROMPT
     assert "Constraint:" in SYSTEM_PROMPT
     assert "Document:" in SYSTEM_PROMPT
-    assert "Citation chỉ xuất dưới dạng marker [n]" in SYSTEM_PROMPT
+    assert "source_ids" in SYSTEM_PROMPT
+    assert "Không tự viết marker trong text/cells" in SYSTEM_PROMPT
     assert SYSTEM_PROMPT.index("</response_style>") < SYSTEM_PROMPT.index("<output_contract>")
     assert SYSTEM_PROMPT.index("</output_contract>") < SYSTEM_PROMPT.rindex("<retrieved_context>")
 
@@ -538,29 +539,6 @@ def test_rag_chain_cites_each_chunk_from_the_same_document_without_a_two_source_
     assert [citation["chunk_id"] for citation in citations] == ["1", "2", "3", "4"]
     for index in range(1, 5):
         assert f'<document id="{index}"' in system_prompt
-
-
-@pytest.mark.parametrize("wrapper", ["final", "assistant_answer"])
-@pytest.mark.parametrize("suffix", ["", "nội dung ngoài câu trả lời", "<|channel|>analysis"])
-def test_rag_chain_stream_rejects_trailing_content_outside_wrapper(wrapper, suffix):
-    from src.generation.grounding import RAGGroundingError
-    chunks = [MockChunk(1, "Thông tin tuyển sinh", {"source": "file.pdf"})]
-    answer = "Thông tin tuyển sinh [1]. " * 8
-    llm = MagicMock()
-    llm.generate.return_value = f"<{wrapper}>{answer}</{wrapper}>" + suffix
-
-    if suffix:
-        with pytest.raises(RAGGroundingError):
-            next(RAGChain(MockRetriever(chunks), llm).answer_stream("Thông tin tuyển sinh"))
-        llm.generate_stream.assert_not_called()
-        return
-
-    events = list(RAGChain(MockRetriever(chunks), llm).answer_stream("Thông tin tuyển sinh"))
-    visible = "".join(event["text"] for event in events if event["type"] == "chunk")
-
-    assert visible == answer.replace(" [1]", "").strip()
-    assert events[-1]["type"] == "metadata"
-    assert events[-1]["citations"][0]["marker"] == 1
 
 
 def test_rag_chain_empty_context():

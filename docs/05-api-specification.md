@@ -27,6 +27,7 @@ Gửi câu hỏi và nhận câu trả lời từ chatbot.
 - `Accept: application/json`: trả JSON đầy đủ qua `ChatResponse`.
 - Nếu gửi cả hai media types, ưu tiên `q` cao hơn; bằng nhau giữ SSE.
 - Request body, citation schema và retrieval score không đổi giữa hai chế độ.
+- Generation có thể dùng văn bản hoặc JSON nội bộ; `source_ids` là tùy chọn cho từng ý/hàng bảng. Backend chỉ kiểm tra định dạng, dựng Markdown và metadata nguồn; không chạy validator nội dung, ngữ nghĩa hoặc độ hỗ trợ của citation. JSON nội bộ không được gửi cho frontend hoặc lưu vào lịch sử chat. Phản hồi rỗng hoặc sai cấu trúc không thể dựng trả `502 / INVALID_GENERATION`.
 
 **Request**:
 ```json
@@ -78,13 +79,15 @@ data: {"type":"metadata","session_id":"...","citations":[{"source":"Admission","
 
 Mỗi event kết thúc bằng một dòng trống. Metadata có thể đến trước text khi
 không có evidence (`out_of_scope`); thứ tự citation và marker khớp context.
-`score` luôn là retrieval score, không phải reranker score.
+`score` là retrieval score của nhánh tìm kiếm, không phải reranker score. Với tra cứu đầy đủ bảng ngành từ index có sẵn, `score=null` vì không thực hiện xếp hạng tìm kiếm.
 
 **Errors**:
 - Request thiếu/sai kiểu field: HTTP `422`; message rỗng: HTTP `400`.
 - RAG chưa sẵn sàng hoặc retrieval/reranking lỗi trước event đầu tiên: HTTP `503`.
 - LLM timeout: `504`; authentication/provider, connection/rate limit và câu trả lời chưa xác minh được: `503`, giữ mã lỗi riêng. Luồng chat không phát `502`.
-- Khi provider gián đoạn hoặc model thiếu citation, chỉ câu hỏi tổng quan phương thức PTIT có bộ nguồn đầy đủ, cùng scope và qua validator mới trả `200` với `answer_mode="evidence"`. Với output thiếu citation, bỏ toàn bộ output đó và tạo câu trả lời độc lập từ nguồn; không đoán marker cho claim chưa được trích dẫn. Câu trả lời bình thường có `answer_mode="generated"`; JSON và metadata SSE dùng cùng trường này. Không có thêm lượt gọi LLM để sửa câu trả lời.
+- Câu hỏi tổng quan danh sách ngành PTIT đọc đủ các phần bảng từ index đã tải, giữ tên ngành/chương trình, mã xét tuyển và nhãn nhóm/dự kiến. Trả `200` với `answer_mode="evidence"` khi dữ liệu bảng đầy đủ; không gọi LLM hoặc cắt danh sách theo top-k. Phía Bắc/phía Nam dùng cùng năm và tài liệu; bảng thiếu hoặc mâu thuẫn trả fallback.
+- Câu hỏi thông tin/tồn tại ngành cụ thể dùng tên chương trình và tên ngành chính thức trong các bảng đã xác minh để lấy mọi dòng phù hợp, giữ toàn bộ cột mã, tên, chỉ tiêu và phương thức/tổ hợp. Nhánh này cũng trả `answer_mode="evidence"`, `score=null`, không gọi LLM và dùng chung JSON/SSE. Không suy ra môn học từ brochure có phần trích xuất rỗng; các câu hỏi học phí/điểm chuẩn/môn học/nghề nghiệp giữ luồng riêng.
+- Khi provider gián đoạn, nhánh trích xuất phương thức PTIT có thể trả `200` với `answer_mode="evidence"` nếu nguồn đầy đủ. Văn bản do model trả về được chuyển tiếp với `answer_mode="generated"`, kể cả khi thiếu citation; không kiểm chứng hoặc thay thế nội dung. JSON và metadata SSE dùng cùng trường này. Không có thêm lượt gọi LLM để sửa câu trả lời.
 - Exception không dự kiến hoặc output dependency sai cấu trúc: `500`.
 - Trước event đầu tiên (và trong chế độ JSON), lỗi dùng JSON
   `{"detail":{"code":"...","message":"..."}}`.

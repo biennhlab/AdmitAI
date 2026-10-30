@@ -114,14 +114,3 @@ async def test_requested_question_with_actual_pinned_candidates(records, monkeyp
         assert citation['title'] == original.metadata['title']
     assert llm.generate.call_count == (0 if prepared is None else 1)
     llm.generate_stream.assert_not_called()
-
-
-@pytest.mark.parametrize('case', ['D', 'E'])
-def test_leading_questions_cannot_approve_inverted_figures(records, case):
-    from src.generation.grounding import RAGGroundingError, validate_answer
-    sources = [records[STANDARD], records[QUALITY]] if case == 'D' else [records[SAT]]
-    answer = ('Học phí đại trà năm học 2026-2027 là 58,3 triệu đồng/năm [1] [2].' if case == 'D'
-              else 'Điểm SAT tối thiểu 25/36 và ACT tối thiểu 1130/1600 [1].')
-    with pytest.raises(RAGGroundingError) as error:
-        validate_answer(answer, sources)
-    assert error.value.reason == 'unsupported_relationship'

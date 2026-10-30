@@ -252,20 +252,6 @@ def test_lite_sse_uses_one_nonstream_provider_call_then_validated_events():
     llm.generate_stream.assert_not_called()
 
 
-def test_lite_sse_rejects_before_first_event_without_trying_another_provider_path():
-    from src.generation.grounding import RAGGroundingError
-
-    chunk = Chunk("sat", "Điểm SAT tối thiểu 1130/1600.", {"doc_id": "d"})
-    llm = MagicMock()
-    llm.generate.return_value = "Điểm SAT tối thiểu 9999 [1]."
-    chain = RAGChain(StaticRetriever([(chunk, .02)]), llm, min_lexical_coverage=0,
-                     reranker=LiteEvidenceSelector())
-    with pytest.raises(RAGGroundingError):
-        next(chain.answer_stream("Điểm SAT tối thiểu?"))
-    llm.generate.assert_called_once()
-    llm.generate_stream.assert_not_called()
-
-
 def test_lite_negative_case_abstains_without_generation():
     llm = StaticLLM("Không được gọi.")
     chain = RAGChain(
@@ -473,7 +459,10 @@ def test_missing_cached_model_never_falls_back_to_download_in_local_profile(monk
     from src.retrieval.embedder import Embedder
     from src.runtime_resources import StartupCheckError
     monkeypatch.setattr(settings, "MODELS_LOCAL_ONLY", True)
-    with patch("src.retrieval.embedder.SentenceTransformer", side_effect=OSError("no cached model")) as factory:
+    with (
+        patch("src.retrieval.embedder.snapshot_download", return_value="cached-test-model"),
+        patch("src.retrieval.embedder.SentenceTransformer", side_effect=OSError("no cached model")) as factory,
+    ):
         with pytest.raises(StartupCheckError) as caught:
             Embedder("local-only-test-model")
     assert caught.value.code == "MODEL_UNAVAILABLE"
@@ -489,17 +478,6 @@ def test_live_availability_abstains_before_retrieval_or_generation():
     assert list(chain.answer_stream(question))[0]["route_type"] == "out_of_scope"
     retriever.search.assert_not_called()
     assert llm.calls == []
-
-
-@pytest.mark.parametrize("answer", [
-    "Điểm SAT 1130 không có marker.", "Điểm SAT 1130 [99].", "Điểm ACT 25 [1].",
-    "Điểm SAT 9999 [1].", "Điểm chuẩn CN10 1130 [1].", "Cơ sở BVH có điểm SAT 1130 [1].",
-    "SAT 1130 [1].\nNgành này bảo đảm việc làm.",
-])
-def test_lite_grounding_rejects_missing_markers_wrong_entities_and_unsupported_claims(answer):
-    from src.generation.grounding import RAGGroundingError, validate_answer
-    with pytest.raises(RAGGroundingError):
-        validate_answer(answer, [Chunk("sat", "Điểm SAT tối thiểu là 1130/1600.", {"campus": "BVS"})])
 
 
 def test_required_golden_quotes_keep_json_sse_source_page_snippet_mapping():

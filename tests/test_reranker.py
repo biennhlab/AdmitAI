@@ -454,87 +454,6 @@ def test_coverage_hybrid_can_return_sixty_but_cross_encoder_receives_ten(
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-@pytest.mark.parametrize("answer, expected_markers", [
-    ("admission eligibility [1]. admission tuition deadline [2].", [1, 2]),
-    ("admission tuition deadline [2] [2]", [2]),
-    ("Answer without markers", None),
-    ("admission tuition [2] [99]", None),
-])
-def test_integration_ranking_provenance_and_citation_mapping(
-    mock_cross_encoder, monkeypatch, streaming, answer, expected_markers,
-):
-    from api.schemas import Citation
-    from src.generation.assembler import ContextAssembler
-
-    monkeypatch.setattr(settings, "RERANK_TOP_K", 2)
-    chunks = [
-        Chunk("a", "admission tuition deadline", {
-            "doc_id": "doc-a", "page_number": 4, "heading": "Fees",
-            "chunk_type": "table", "parent_chunk_id": "parent-a",
-            "title": "Source A", "source_url": "https://example.org/a",
-            "expansion_type": "exact",
-        }),
-        Chunk("b", "admission eligibility", {
-            "doc_id": "doc-b", "page_number": 9, "heading": "Eligibility",
-            "chunk_type": "child", "parent_chunk_id": "parent-b",
-            "title": "Source B", "source_url": "https://example.org/b",
-            "expansion_type": "neighbor",
-        }),
-        Chunk("c", "admission other evidence", {"doc_id": "doc-c"}),
-    ]
-    candidates = list(zip(chunks, [0.9, 0.7, 0.6]))
-    before = deepcopy(candidates)
-    retriever = RecordingRetriever(candidates)
-    llm = RecordingLLM(answer)
-    mock_cross_encoder.return_value.predict.return_value = [-10.0, 9.0, -20.0]
-    chain = RAGChain(retriever, llm, top_k=17, reranker=Reranker())
-    history = [{"role": "user", "content": "Earlier question"}]
-    assembled_inputs = []
-    original_assemble = ContextAssembler.assemble
-
-    def capture_assemble(self, retrieved):
-        assembled_inputs.extend(retrieved)
-        return original_assemble(self, retrieved)
-
-    with patch.object(ContextAssembler, "assemble", capture_assemble):
-        if expected_markers is None:
-            from src.generation.grounding import RAGGroundingError
-            with pytest.raises(RAGGroundingError):
-                run_chain(chain, streaming, "admission tuition deadline", history)
-            assert candidates == before
-            assert len(llm.calls) == 1
-            return
-        result = run_chain(chain, streaming, "admission tuition deadline", history)
-
-    assert result.route_type == "general"
-    assert result.answer == answer.replace(" [1]", "").replace(" [2]", "")
-    assert retriever.calls == [("admission tuition deadline", 17)]
-    assert [id(c) for c, _ in assembled_inputs] == [id(chunks[1]), id(chunks[0])]
-    assert candidates == before
-    for chunk, _ in assembled_inputs:
-        assert chunk.metadata is chunks[1 if chunk.chunk_id == "b" else 0].metadata
-        assert {"doc_id", "page_number", "heading", "chunk_type", "parent_chunk_id"} <= chunk.metadata.keys()
-    prompt = llm.calls[0]["system_prompt"]
-    # Neither assembler expansion priority nor lexical overlap may undo reranking.
-    assert re.findall(r'<document id="\d+" doc_id="([^"]*)"', prompt) == ["doc-b", "doc-a"]
-    assert 'retrieval_score="0.7000"' in prompt
-    assert 'retrieval_score="0.9000"' in prompt
-    assert "doc-c" not in prompt
-    assert llm.calls[0]["messages"][0] == history[0]
-    assert history == [{"role": "user", "content": "Earlier question"}]
-    assert [c["marker"] for c in result.citations] == expected_markers
-    for citation in result.citations:
-        chunk, score = [candidates[1], candidates[0]][citation["marker"] - 1]
-        assert citation["chunk_id"] == chunk.chunk_id
-        assert citation["doc_id"] == chunk.metadata["doc_id"]
-        assert citation["page"] == chunk.metadata["page_number"]
-        assert citation["source_url"] == chunk.metadata["source_url"]
-        assert citation["score"] == score
-        assert citation["snippet"] in chunk.content
-        assert Citation(**citation).model_dump() == citation
-
-
-@pytest.mark.parametrize("streaming", [False, True])
 def test_threshold_filters_retrieval_score_before_rerank(mock_cross_encoder, streaming):
     keep = Chunk("keep", "admission supported")
     drop = Chunk("drop", "admission unsupported")
@@ -600,34 +519,6 @@ def test_duplicate_content_from_different_sources_remains_distinct(mock_cross_en
     )
     assert [c["chunk_id"] for c in result.citations] == ["a", "duplicate", "b"]
     assert [c["marker"] for c in result.citations] == [1, 2, 3]
-
-
-@pytest.mark.parametrize("streaming", [False, True])
-def test_no_marker_after_reranker_selects_top_five_rejects_generation(
-    mock_cross_encoder, monkeypatch, streaming,
-):
-    monkeypatch.setattr(settings, "RERANK_TOP_K", 5)
-    candidates = [
-        (
-            Chunk(
-                str(index),
-                f"admission evidence {index}",
-                {"doc_id": f"doc-{index}", "page_number": index + 1},
-            ),
-            1.0 - index / 10,
-        )
-        for index in range(6)
-    ]
-    mock_cross_encoder.return_value.predict.return_value = list(range(6))
-    llm = RecordingLLM("Answer without citation markers")
-
-    from src.generation.grounding import RAGGroundingError
-    with pytest.raises(RAGGroundingError, match="citation marker"):
-        run_chain(
-            RAGChain(RecordingRetriever(candidates), llm, top_k=6, reranker=Reranker()),
-            streaming,
-        )
-    assert llm.calls[0]["system_prompt"].count('<document id="') == 5
 
 
 @pytest.mark.parametrize("streaming", [False, True])
