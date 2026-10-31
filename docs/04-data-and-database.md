@@ -2,6 +2,7 @@
 
 > Nguồn dữ liệu RAG, schema database, và chiến lược lưu trữ.  
 > Xem kiến trúc: [02-system-architecture.md](./02-system-architecture.md)
+> Quy trình chuẩn bị, audit và xuất dữ liệu hiện tại: [13-rag-data-quality.md](./13-rag-data-quality.md).
 
 ---
 

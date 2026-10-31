@@ -50,8 +50,9 @@ def test_cached_snapshot_resolves_before_model_load_without_credentials(tmp_path
         patch('src.retrieval.embedder.SentenceTransformer') as factory,
     ):
         Embedder('cached-model')
+    from src.retrieval.embedder import DENSE_SNAPSHOT_IGNORE_PATTERNS
     resolve.assert_called_once_with(repo_id='cached-model', cache_dir=settings.HUGGINGFACE_CACHE_DIR,
-                                    local_files_only=True)
+                                    local_files_only=True, ignore_patterns=DENSE_SNAPSHOT_IGNORE_PATTERNS)
     factory.assert_called_once_with(str(tmp_path.resolve()), cache_folder=settings.HUGGINGFACE_CACHE_DIR,
                                     local_files_only=True)
 

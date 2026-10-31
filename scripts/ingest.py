@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import sys
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,10 +34,16 @@ from src.retrieval.index_version import (
     index_build_fingerprint,
     manifest_build_stale_reasons,
 )
+from scripts.audit_rag_data import audit_documents, source_coverage_gaps
+
+# Version source parsing/chunk preparation independently of the persisted
+# vector/payload format so the existing serving snapshot remains readable.
+DATA_PIPELINE_REVISION = "rag-data-v4-20261031"
 
 
-def corpus_fingerprint(documents: list, module: int) -> str:
-    """Fingerprint corpus inputs while preserving the existing golden-data value."""
+def corpus_fingerprint(documents: list, module: int, *, child_size: int | None = None,
+                       parent_size: int | None = None, table_size: int | None = None) -> str:
+    """Fingerprint actual text, parsed structure, metadata and pipeline version."""
     digest = hashlib.sha256()
     chunking_config = {
         "module": module,
@@ -44,14 +51,15 @@ def corpus_fingerprint(documents: list, module: int) -> str:
         "chunk_size": settings.CHUNK_SIZE,
         "chunk_overlap": settings.CHUNK_OVERLAP,
         "embedding_input": "title_section_content_v1",
+        "data_pipeline_revision": DATA_PIPELINE_REVISION,
     }
     if module in {2, 3}:
         chunking_config.update(
             {
-                "table_chunk_size": settings.TABLE_CHUNK_SIZE,
-                "parent_chunk_size": settings.PARENT_CHUNK_SIZE,
-                "child_chunk_size": settings.CHILD_CHUNK_SIZE,
-                "chunking_strategy": "combined_v2",
+                "table_chunk_size": settings.TABLE_CHUNK_SIZE if table_size is None else table_size,
+                "parent_chunk_size": settings.PARENT_CHUNK_SIZE if parent_size is None else parent_size,
+                "child_chunk_size": settings.CHILD_CHUNK_SIZE if child_size is None else child_size,
+                "chunking_strategy": DATA_PIPELINE_REVISION,
             }
         )
     digest.update(
@@ -59,6 +67,11 @@ def corpus_fingerprint(documents: list, module: int) -> str:
     )
     for document in documents:
         digest.update(document.doc_id.encode("utf-8"))
+        # Do not rely on a frontmatter hash to notice source edits. Parsed
+        # structure also affects the retrieval payload (especially PDF tables).
+        digest.update(str(getattr(document, "content", "")).encode("utf-8"))
+        for page in getattr(document, "pages", []) or []:
+            digest.update(json.dumps(asdict(page), ensure_ascii=False, sort_keys=True).encode("utf-8"))
         # Citation-only changes (URL/title/date/section) must also refresh the
         # persisted payload even when body text and vectors are unchanged.
         digest.update(
@@ -67,16 +80,17 @@ def corpus_fingerprint(documents: list, module: int) -> str:
     return digest.hexdigest()
 
 
-def build_fingerprint(module: int, revision: str = INDEX_BUILD_REVISION) -> str:
+def build_fingerprint(module: int, revision: str = INDEX_BUILD_REVISION, *, child_size: int | None = None,
+                      parent_size: int | None = None, table_size: int | None = None) -> str:
     """Fingerprint build code/config independently from the corpus inputs."""
     return index_build_fingerprint(
         module,
         embedding_model=settings.EMBEDDING_MODEL,
         chunk_size=settings.CHUNK_SIZE,
         chunk_overlap=settings.CHUNK_OVERLAP,
-        table_chunk_size=settings.TABLE_CHUNK_SIZE,
-        parent_chunk_size=settings.PARENT_CHUNK_SIZE,
-        child_chunk_size=settings.CHILD_CHUNK_SIZE,
+        table_chunk_size=settings.TABLE_CHUNK_SIZE if table_size is None else table_size,
+        parent_chunk_size=settings.PARENT_CHUNK_SIZE if parent_size is None else parent_size,
+        child_chunk_size=settings.CHILD_CHUNK_SIZE if child_size is None else child_size,
         revision=revision,
     )
 
@@ -98,7 +112,7 @@ def load_reusable_snapshot(
         return None
     if any(
         manifest.get(field)
-        for field in ("load_errors", "chunk_errors", "embedding_errors")
+        for field in ("load_errors", "chunk_errors", "embedding_errors", "quality_errors")
     ):
         return None
     # This validates schema, vector existence, checksum, and row alignment before
@@ -110,6 +124,7 @@ def build_chunks(
     documents: list,
     module: int = 1,
     parent_store: list[Chunk] | None = None,
+    *, child_size: int | None = None, parent_size: int | None = None, table_size: int | None = None,
 ) -> tuple[list[Chunk], list[dict[str, str]]]:
     if module not in {1, 2, 3}:
         raise ValueError("module must be 1 (naive), 2 (advanced), or 3 (hybrid)")
@@ -134,9 +149,9 @@ def build_chunks(
                 document_parents: list[Chunk] = []
                 document_chunks = combined_chunk(
                     pages,
-                    max_size=settings.TABLE_CHUNK_SIZE,
-                    parent_size=settings.PARENT_CHUNK_SIZE,
-                    child_size=settings.CHILD_CHUNK_SIZE,
+                    max_size=settings.TABLE_CHUNK_SIZE if table_size is None else table_size,
+                    parent_size=settings.PARENT_CHUNK_SIZE if parent_size is None else parent_size,
+                    child_size=settings.CHILD_CHUNK_SIZE if child_size is None else child_size,
                     metadata=metadata,
                     parent_chunks=document_parents,
                 )
@@ -156,18 +171,29 @@ def embed_chunks(embedder: Embedder, chunks: list[Chunk]) -> tuple[list[Chunk], 
     errors: list[dict[str, str]] = []
     batch_size = max(1, settings.EMBEDDING_BATCH_SIZE)
     total_batches = (len(chunks) + batch_size - 1) // batch_size
+    dimension: int | None = None
+
+    def validate(value: object, rows: int) -> np.ndarray:
+        nonlocal dimension
+        matrix = np.asarray(value, dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[0] != rows or matrix.shape[1] == 0:
+            raise ValueError("Embedding provider returned an invalid matrix")
+        if not np.isfinite(matrix).all() or not np.all(np.any(matrix != 0, axis=1)):
+            raise ValueError("Embedding provider returned non-finite or zero vectors")
+        if dimension is not None and matrix.shape[1] != dimension:
+            raise ValueError("Embedding dimensions differ between batches")
+        dimension = matrix.shape[1]
+        return matrix
     for batch_number, start in enumerate(range(0, len(chunks), batch_size), start=1):
         batch = chunks[start : start + batch_size]
         try:
-            matrix = embedder.embed([chunk_search_text(chunk) for chunk in batch])
-            if matrix.ndim != 2 or matrix.shape[0] != len(batch):
-                raise ValueError("Embedding provider returned an invalid matrix")
+            matrix = validate(embedder.embed([chunk_search_text(chunk) for chunk in batch]), len(batch))
             successful_chunks.extend(batch)
             matrices.append(matrix)
         except Exception as batch_exc:
             for chunk in batch:
                 try:
-                    vector = embedder.embed([chunk_search_text(chunk)])
+                    vector = validate(embedder.embed([chunk_search_text(chunk)]), 1)
                     successful_chunks.append(chunk)
                     matrices.append(vector)
                 except Exception as exc:
@@ -336,15 +362,30 @@ def main() -> int:
     parser.add_argument("--index-dir", required=True, help="Explicit output directory, separate from the active index")
     parser.add_argument("--collection", help="Module 3 migration collection, separate from the active collection")
     parser.add_argument("--force", action="store_true", help="Re-embed even when the corpus is unchanged")
+    parser.add_argument("--allow-partial", action="store_true", help="Explicitly permit an incomplete corpus after load/chunk/embedding errors")
+    parser.add_argument("--child-size", type=int, help="Override advanced child chunk characters")
+    parser.add_argument("--parent-size", type=int, help="Override advanced parent chunk characters")
+    parser.add_argument("--table-size", type=int, help="Override table chunk target characters; complete rows remain atomic")
     args = parser.parse_args()
     try:
         args.index_dir = validate_ingest_destination(args.module, args.index_dir, args.collection)
     except (OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
+    chunking_options = {key: value for key, value in {
+        "child_size": args.child_size, "parent_size": args.parent_size, "table_size": args.table_size,
+    }.items() if value is not None}
+    if args.module == 1 and chunking_options:
+        parser.error("Advanced chunk sizes require --module 2 or 3")
+    if any(value <= 0 for value in chunking_options.values()):
+        parser.error("Chunk sizes must be positive")
+    if (args.child_size or settings.CHILD_CHUNK_SIZE) > (args.parent_size or settings.PARENT_CHUNK_SIZE):
+        parser.error("child-size must not exceed parent-size")
     load_result = load_documents(args.data_dir, prefer_processed=True)
+    if load_result.errors and not args.allow_partial:
+        raise RuntimeError(f"Source loading failed for {len(load_result.errors)} files; refusing an incomplete index: {load_result.errors[:3]}")
     page_count = sum(len(getattr(document, "pages", []) or []) or 1 for document in load_result.documents)
-    fingerprint = corpus_fingerprint(load_result.documents, args.module)
-    expected_build_fingerprint = build_fingerprint(args.module)
+    fingerprint = corpus_fingerprint(load_result.documents, args.module, **chunking_options)
+    expected_build_fingerprint = build_fingerprint(args.module, **chunking_options)
     existing = read_manifest(args.index_dir)
     reusable = None
     if not args.force:
@@ -402,9 +443,14 @@ def main() -> int:
         return 0
 
     parent_chunks: list[Chunk] = []
-    chunks, chunk_errors = build_chunks(load_result.documents, args.module, parent_chunks)
+    chunks, chunk_errors = build_chunks(load_result.documents, args.module, parent_chunks, **chunking_options)
+    if chunk_errors and not args.allow_partial:
+        raise RuntimeError(f"Chunking failed for {len(chunk_errors)} documents; refusing an incomplete index: {chunk_errors[:3]}")
     if not chunks:
         raise RuntimeError("No chunks were produced; refusing to replace the existing index")
+    data_quality = audit_documents(load_result.documents, chunks, parent_chunks) if args.module in {2, 3} and load_result.documents else {}
+    if data_quality.get("errors") and not args.allow_partial:
+        raise RuntimeError(f"Data fidelity checks failed; refusing an incomplete index: {data_quality['errors'][:3]}")
     table_chunk_count = sum(chunk.metadata.get("chunk_type") == "table" for chunk in chunks)
     child_chunk_count = sum(chunk.metadata.get("chunk_type") == "child" for chunk in chunks)
     print(
@@ -431,6 +477,15 @@ def main() -> int:
         if not indexed_chunks:
             raise RuntimeError("No embeddings were produced; refusing to replace the existing index")
 
+    if embedding_errors and not args.allow_partial:
+        raise RuntimeError(f"Embedding failed for {len(embedding_errors)} chunks; refusing an incomplete index: {embedding_errors[:3]}")
+    # A partial build still needs a truthful, bidirectional parent registry.
+    indexed_ids = {chunk.chunk_id for chunk in indexed_chunks}
+    for parent in parent_chunks:
+        parent.metadata["child_chunk_ids"] = [child_id for child_id in parent.metadata.get("child_chunk_ids", []) if child_id in indexed_ids]
+        parent.metadata["child_count"] = len(parent.metadata["child_chunk_ids"])
+    parent_chunks = [parent for parent in parent_chunks if parent.metadata["child_count"]]
+
     indexed_doc_ids = {chunk.metadata.get("doc_id") for chunk in indexed_chunks}
     manifest_metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -439,6 +494,10 @@ def main() -> int:
         "embedding_model": settings.EMBEDDING_MODEL,
         "chunk_size": settings.CHUNK_SIZE,
         "chunk_overlap": settings.CHUNK_OVERLAP,
+        "data_pipeline_revision": DATA_PIPELINE_REVISION,
+        "child_chunk_size": args.child_size or settings.CHILD_CHUNK_SIZE,
+        "parent_chunk_size": args.parent_size or settings.PARENT_CHUNK_SIZE,
+        "table_chunk_size": args.table_size or settings.TABLE_CHUNK_SIZE,
         "embedding_input": "title_section_content_v1",
         "retrieval_backend": (
             "hybrid_qdrant_bm25_rrf" if args.module == 3 else "naive_dense_numpy"
@@ -463,6 +522,10 @@ def main() -> int:
         "load_errors": load_result.errors,
         "chunk_errors": chunk_errors,
         "embedding_errors": embedding_errors,
+        "source_warnings": getattr(load_result, "warnings", []),
+        "data_quality": data_quality,
+        "quality_errors": data_quality.get("errors", []),
+        "source_coverage_gaps": source_coverage_gaps(Path(load_result.source_dir)),
         "skipped_duplicates": load_result.skipped_duplicates,
     }
 

@@ -228,6 +228,15 @@ def select_content_html(soup: BeautifulSoup) -> str:
 def clean_content_html(content_html: str, base_url: str) -> tuple[str, list[str], dict[str, int]]:
     soup = BeautifulSoup(content_html, "html.parser")
     original_table_count = len(soup.find_all("table"))
+    # Accordion question labels are semantic headings. Preserve them before
+    # removing CSS classes, otherwise question and answer are chunked apart.
+    for question in soup.select(".elementor-accordion-title, summary"):
+        question.name = "h3"
+    for embedded in soup.find_all("iframe"):
+        if embedded.get("src"):
+            link = soup.new_tag("a", href=urljoin(base_url, embedded["src"]))
+            link.string = "Video/tài liệu nhúng cần trích nội dung"
+            embedded.replace_with(link)
     for tag in soup.find_all(["script", "style", "nav", "footer", "form", "iframe", "noscript"]):
         tag.decompose()
     for tag in soup.find_all(True):
@@ -242,7 +251,7 @@ def clean_content_html(content_html: str, base_url: str) -> tuple[str, list[str]
             links.append(tag["href"])
     for img in soup.find_all("img"):
         if not img.get("alt"):
-            img.decompose()
+            img["alt"] = "Ảnh nội dung cần OCR"
     text = soup.get_text(" ", strip=True)
     stats = {
         "source_table_count": original_table_count,

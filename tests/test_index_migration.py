@@ -363,18 +363,26 @@ def test_preflight_blocks_when_qdrant_is_offline(tmp_path):
     assert {call[0] for call in qdrant.calls} == {"collection_exists"}
 
 
-def test_phase_a_dry_run_counts_and_golden_ids_are_preserved():
+def test_data_pipeline_migration_preserves_golden_source_facts_with_new_ids():
+    from collections import defaultdict
+    from scripts.audit_rag_data import _tokens, audit_documents
+
     load_result = load_documents("data/processed")
     parents = []
     chunks, errors = build_chunks(load_result.documents, 3, parents)
     golden = load_json(DEFAULT_DATASET)
-    proposed_ids = {chunk.chunk_id for chunk in [*chunks, *parents]}
-
     assert errors == []
-    assert len(chunks) == 3185
-    assert len(parents) == 1119
-    assert set(golden["evidence_catalog"]) <= proposed_ids
-    assert corpus_fingerprint(load_result.documents, 3) == golden["corpus"]["fingerprint"]
+    assert audit_documents(load_result.documents, chunks, parents)["errors"] == []
+    # Chunk boundaries/IDs intentionally change. Keep the existing serving
+    # golden set intact and verify its facts remain at the same source locator.
+    source_tokens = defaultdict(set)
+    for chunk in chunks:
+        locator = (chunk.metadata["doc_id"], chunk.metadata["page_number"], chunk.metadata["source_url"])
+        source_tokens[locator].update(_tokens(chunk.content + " " + " ".join(chunk.metadata.get("heading_path", []))))
+    for evidence in golden["evidence_catalog"].values():
+        locator = (evidence["doc_id"], evidence["page"], evidence["source_url"])
+        assert _tokens(evidence["quote"]) <= source_tokens[locator]
+    assert corpus_fingerprint(load_result.documents, 3) != golden["corpus"]["fingerprint"]
 
 
 @pytest.mark.parametrize("failure,code", [
