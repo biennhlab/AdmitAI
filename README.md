@@ -13,8 +13,7 @@ Giao diện được xây dựng bằng Next.js; backend FastAPI điều phối 
 - [Công nghệ sử dụng](#công-nghệ-sử-dụng)
 - [Cấu trúc thư mục](#cấu-trúc-thư-mục)
 - [Cài đặt và chạy cục bộ](#cài-đặt-và-chạy-cục-bộ)
-- [Cấu hình](#cấu-hình)
-- [API và luồng phản hồi](#api-và-luồng-phản-hồi)
+- [Cấu hình](#cấu-hình) 
 - [Kiểm thử và đánh giá](#kiểm-thử-và-đánh-giá)
 - [Vận hành và xử lý sự cố](#vận-hành-và-xử-lý-sự-cố)
 - [Phạm vi hiện tại](#phạm-vi-hiện-tại)
@@ -224,35 +223,7 @@ Backend đọc `.env`; frontend đọc `frontend/.env.local`. Tham khảo đầy
 | `BACKEND_REQUEST_TIMEOUT_MS` | Thời gian chờ của proxy frontend |
 
 Khi `LOCAL_DEV_PROFILE=true`, cấu hình áp dụng cặp chỉ mục/collection nêu trên, dùng `RERANK_BACKEND=lite`, tắt query rewrite và bật `MODELS_LOCAL_ONLY=true`. Model được nạp từ cache cục bộ; ứng dụng không tự tải model khi khởi động. Profile này yêu cầu BGE-M3 và endpoint Google AI đã cấu hình.
-
-## API và luồng phản hồi
-
-| Endpoint | Chức năng |
-| --- | --- |
-| `GET /api/health` | Kiểm tra database, chỉ mục, Qdrant, cấu hình LLM và RAG |
-| `POST /api/chat` | Gửi câu hỏi, nhận câu trả lời và nguồn tham khảo |
-| `POST /api/auth/login` | Đăng nhập và nhận JWT |
-
-Chat mặc định trả SSE; đặt `Accept: application/json` để nhận toàn bộ phản hồi JSON từ backend. Ví dụ chạy trong PowerShell:
-
-```powershell
-$chatBody = @{
-    message = 'PTIT có những phương thức tuyển sinh nào năm 2026?'
-} | ConvertTo-Json
-
-Invoke-RestMethod -Uri http://127.0.0.1:8000/api/chat `
-    -Method Post `
-    -ContentType 'application/json; charset=utf-8' `
-    -Headers @{ Accept = 'application/json' } `
-    -Body ([System.Text.Encoding]::UTF8.GetBytes($chatBody))
-```
-
-Gửi thêm `session_id` từ phản hồi trước để tiếp tục phiên đang có trong bộ nhớ. Phản hồi gồm `answer`, `citations`, `route_type`, `session_id` và `answer_mode` khi có nhánh phản hồi tương ứng.
-
-Nguồn tham khảo là tùy chọn. Backend ánh xạ ID nguồn hợp lệ sang metadata của tài liệu thực, dựng Markdown và kiểm tra định dạng phản hồi. **Hiện không có lớp grounding tự động kiểm chứng tính đúng của nội dung, số liệu hoặc mức độ nguồn hỗ trợ câu trả lời.** Thiếu citation không làm câu trả lời bị từ chối.
-
-Phản hồi rỗng hoặc JSON nội bộ không thể dựng trả lỗi `INVALID_GENERATION`; lỗi provider và truy xuất có mã riêng. Chi tiết cơ chế tại [sinh câu trả lời và nguồn tham khảo](docs/chat-generation-and-citations.md), schema và mã lỗi tại [đặc tả API](docs/05-api-specification.md).
-
+ 
 ## Kiểm thử và đánh giá
 
 Chạy kiểm thử backend từ thư mục gốc, trong môi trường Python đã cài phụ thuộc:
